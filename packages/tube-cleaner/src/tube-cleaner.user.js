@@ -96,7 +96,7 @@
     // ------------------------------------------------------------------
 
     var AUTO_PIP_KEY = 'wblock.tubeCleaner.autoPiP';
-    var autoPiPEnabled = true;
+    var autoPiPEnabled = false;
     var pipActive = false;
 
     function getAutoPiP() {

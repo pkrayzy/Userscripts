@@ -96,14 +96,14 @@
     // ------------------------------------------------------------------
 
     var AUTO_PIP_KEY = 'wblock.tubeCleaner.autoPiP';
-    var autoPiPEnabled = true;
+    var autoPiPEnabled = false;
     var pipActive = false;
 
     function getAutoPiP() {
         try {
             var stored = localStorage.getItem(AUTO_PIP_KEY);
-            return stored === null ? false : stored === '1';
-        } catch (e) { return false; }
+            return stored === null ? true : stored === '1';
+        } catch (e) { return true; }
     }
 
     function setAutoPiP(v) {
@@ -1074,6 +1074,7 @@
         setupMediaSession(player, video);
         setupChapters(player, video);
         setupNativeSubtitles(player, video);
+        setupSponsorBlock(player, video);
     }
 
     var mediaSessionOwner = null;
@@ -1402,6 +1403,975 @@
             if (!video.hasAttribute('playsinline')) { video.setAttribute('playsinline', ''); }
             if (!video.hasAttribute('webkit-playsinline')) { video.setAttribute('webkit-playsinline', ''); }
         } catch (e) { /* ignore */ }
+    }
+
+    // ------------------------------------------------------------------
+    // SponsorBlock
+    //
+    // Query SponsorBlock's k-anonymous endpoint with only five hexadecimal
+    // characters of the video's SHA-256 hash. The exact YouTube id never leaves
+    // the page; the returned bucket is filtered locally. Deliberately fetch all
+    // supported categories once; defaults still enable only standard
+    // sponsors so Tube Cleaner does not unexpectedly remove editorial content.
+    // ------------------------------------------------------------------
+
+    var SPONSORBLOCK_API = 'https://sponsor.ajay.app/api/skipSegments/';
+    var SPONSORBLOCK_SETTINGS_KEY = 'wblock.tubeCleaner.sponsorBlock';
+    var SPONSORBLOCK_CATEGORIES = [
+        { id: 'sponsor', color: '#00d400' },
+        { id: 'selfpromo', color: '#ffff00' },
+        { id: 'interaction', color: '#cc00ff' },
+        { id: 'intro', color: '#00ffff' },
+        { id: 'outro', color: '#0202ed' },
+        { id: 'preview', color: '#008fd6' },
+        { id: 'filler', color: '#7300ff' },
+        { id: 'music_offtopic', color: '#ff9900' }
+    ];
+    var sponsorBlockDisabledVideos = {};
+    var sponsorBlockSettingsCache = null;
+    // YouTube keeps the page alive across navigations. Retain a small resolved
+    // segment cache for that session so revisiting a video does not query the
+    // same hash bucket again. Empty results are cached too.
+    var sponsorBlockSegmentCache = {};
+    var sponsorBlockSegmentCacheOrder = [];
+
+    function cachedSponsorBlockSegments(videoId) {
+        return Object.prototype.hasOwnProperty.call(sponsorBlockSegmentCache, videoId) ?
+            sponsorBlockSegmentCache[videoId] : null;
+    }
+
+    function cacheSponsorBlockSegments(videoId, segments) {
+        if (!Object.prototype.hasOwnProperty.call(sponsorBlockSegmentCache, videoId)) {
+            sponsorBlockSegmentCacheOrder.push(videoId);
+        }
+        sponsorBlockSegmentCache[videoId] = segments;
+        while (sponsorBlockSegmentCacheOrder.length > 24) {
+            delete sponsorBlockSegmentCache[sponsorBlockSegmentCacheOrder.shift()];
+        }
+    }
+
+    function sponsorBlockLocale() {
+        var language = (navigator.language || 'en').toLowerCase().split('-')[0];
+        var english = {
+            title: 'SponsorBlock settings', enabled: 'Enable SponsorBlock', notice: 'Show Undo after automatic skips',
+            duration: 'Minimum segment length', current: 'Disable for this video', channel: 'Disable on this channel', reset: 'Reset defaults',
+            using: 'Using SponsorBlock',
+            hideControls: 'Hide these controls (double-tap the video to show them)',
+            any: 'Any length', auto: 'Auto skip', ask: 'Show skip button', off: 'Disabled',
+            skipped: 'segment skipped', segment: 'segment', undo: 'Undo', skip: 'Skip',
+            names: ['Sponsor', 'Self-promotion', 'Interaction reminder', 'Intro', 'Outro', 'Preview or recap', 'Filler', 'Off-topic music']
+        };
+        var translations = {
+            de: { title:'SponsorBlock-Einstellungen',enabled:'SponsorBlock aktivieren',notice:'Rückgängig nach automatischem Überspringen anzeigen',duration:'Mindestlänge',current:'Für dieses Video deaktivieren',reset:'Zurücksetzen',any:'Beliebige Länge',auto:'Automatisch',ask:'Schaltfläche anzeigen',off:'Deaktiviert',skipped:'übersprungen',segment:'Segment',undo:'Rückgängig',skip:'Überspringen',names:['Sponsor','Eigenwerbung','Interaktionserinnerung','Intro','Outro','Vorschau oder Rückblick','Füllmaterial','Themenfremde Musik'] },
+            es: { title:'Ajustes de SponsorBlock',enabled:'Activar SponsorBlock',notice:'Mostrar Deshacer tras saltos automáticos',duration:'Duración mínima',current:'Desactivar para este vídeo',reset:'Restablecer',any:'Cualquier duración',auto:'Saltar automáticamente',ask:'Mostrar botón',off:'Desactivado',skipped:'omitido',segment:'segmento',undo:'Deshacer',skip:'Saltar',names:['Patrocinio','Autopromoción','Recordatorio de interacción','Introducción','Cierre','Avance o resumen','Relleno','Música no relacionada'] },
+            fr: { title:'Réglages SponsorBlock',enabled:'Activer SponsorBlock',notice:'Afficher Annuler après les sauts automatiques',duration:'Durée minimale',current:'Désactiver pour cette vidéo',reset:'Réinitialiser',any:'Toute durée',auto:'Ignorer automatiquement',ask:'Afficher le bouton',off:'Désactivé',skipped:'ignoré',segment:'segment',undo:'Annuler',skip:'Ignorer',names:['Sponsor','Autopromotion','Rappel d’interaction','Introduction','Conclusion','Aperçu ou résumé','Remplissage','Musique hors sujet'] },
+            it: { title:'Impostazioni SponsorBlock',enabled:'Attiva SponsorBlock',notice:'Mostra Annulla dopo i salti automatici',duration:'Durata minima',current:'Disattiva per questo video',reset:'Ripristina',any:'Qualsiasi durata',auto:'Salta automaticamente',ask:'Mostra pulsante',off:'Disattivato',skipped:'saltato',segment:'segmento',undo:'Annulla',skip:'Salta',names:['Sponsor','Autopromozione','Promemoria interazione','Introduzione','Finale','Anteprima o riepilogo','Riempitivo','Musica fuori tema'] },
+            pt: { title:'Configurações do SponsorBlock',enabled:'Ativar SponsorBlock',notice:'Mostrar Desfazer após pulos automáticos',duration:'Duração mínima',current:'Desativar para este vídeo',reset:'Restaurar padrões',any:'Qualquer duração',auto:'Pular automaticamente',ask:'Mostrar botão',off:'Desativado',skipped:'ignorado',segment:'segmento',undo:'Desfazer',skip:'Pular',names:['Patrocínio','Autopromoção','Lembrete de interação','Introdução','Encerramento','Prévia ou resumo','Enchimento','Música fora do tema'] },
+            ja: { title:'SponsorBlock設定',enabled:'SponsorBlockを有効にする',notice:'自動スキップ後に元に戻すを表示',duration:'最小セグメント長',current:'この動画では無効にする',reset:'初期設定に戻す',any:'すべての長さ',auto:'自動スキップ',ask:'スキップボタンを表示',off:'無効',skipped:'をスキップしました',segment:'セグメント',undo:'元に戻す',skip:'スキップ',names:['スポンサー','自己宣伝','操作のお願い','イントロ','アウトロ','予告・あらすじ','フィラー','無関係な音楽'] },
+            ko: { title:'SponsorBlock 설정',enabled:'SponsorBlock 활성화',notice:'자동 건너뛰기 후 실행 취소 표시',duration:'최소 구간 길이',current:'이 동영상에서 비활성화',reset:'기본값 복원',any:'모든 길이',auto:'자동 건너뛰기',ask:'건너뛰기 버튼 표시',off:'비활성화',skipped:'건너뜀',segment:'구간',undo:'실행 취소',skip:'건너뛰기',names:['스폰서','자기 홍보','상호작용 알림','인트로','아웃트로','미리보기 또는 요약','필러','주제와 무관한 음악'] },
+            ru: { title:'Настройки SponsorBlock',enabled:'Включить SponsorBlock',notice:'Показывать отмену после автопропуска',duration:'Минимальная длина',current:'Отключить для этого видео',reset:'Сбросить',any:'Любая длина',auto:'Пропускать автоматически',ask:'Показывать кнопку',off:'Отключено',skipped:'пропущен',segment:'фрагмент',undo:'Отменить',skip:'Пропустить',names:['Спонсор','Самореклама','Напоминание о взаимодействии','Вступление','Концовка','Анонс или обзор','Заполнитель','Музыка не по теме'] },
+            zh: { title:'SponsorBlock 设置',enabled:'启用 SponsorBlock',notice:'自动跳过后显示撤销',duration:'最短片段长度',current:'对这个视频停用',reset:'恢复默认设置',any:'任意长度',auto:'自动跳过',ask:'显示跳过按钮',off:'已停用',skipped:'已跳过',segment:'片段',undo:'撤销',skip:'跳过',names:['赞助内容','自我推广','互动提醒','片头','片尾','预告或回顾','填充内容','无关音乐'] }
+        };
+        var selected = translations[language] || english;
+        var channelLabels = { de:'Auf diesem Kanal deaktivieren', es:'Desactivar en este canal',
+            fr:'Désactiver sur cette chaîne', it:'Disattiva su questo canale', pt:'Desativar neste canal',
+            ja:'このチャンネルでは無効にする', ko:'이 채널에서 비활성화', ru:'Отключить на этом канале', zh:'对这个频道停用' };
+        var usingLabels = { de:'Verwendet SponsorBlock', es:'Usa SponsorBlock', fr:'Utilise SponsorBlock',
+            it:'Usa SponsorBlock', pt:'Usa SponsorBlock', ja:'SponsorBlockを使用', ko:'SponsorBlock 사용',
+            ru:'Использует SponsorBlock', zh:'使用 SponsorBlock' };
+        if (!selected.channel) selected.channel = channelLabels[language] || english.channel;
+        if (!selected.using) selected.using = usingLabels[language] || english.using;
+        var hideControlsLabels = { de:'Diese Steuerelemente ausblenden (Doppeltippen auf das Video zeigt sie)',
+            es:'Ocultar estos controles (toca dos veces el vídeo para mostrarlos)',
+            fr:'Masquer ces commandes (touchez deux fois la vidéo pour les afficher)',
+            it:'Nascondi questi controlli (tocca due volte il video per mostrarli)',
+            pt:'Ocultar estes controles (toque duas vezes no vídeo para mostrá-los)',
+            ja:'このコントロールを非表示（動画をダブルタップで表示）', ko:'이 컨트롤 숨기기(동영상을 두 번 탭하면 표시)',
+            ru:'Скрыть эти элементы управления (двойное нажатие по видео покажет их)', zh:'隐藏这些控件（双击视频可显示）' };
+        if (!selected.hideControls) selected.hideControls = hideControlsLabels[language] || english.hideControls;
+        return selected;
+    }
+
+    function defaultSponsorBlockSettings() {
+        var modes = {};
+        for (var i = 0; i < SPONSORBLOCK_CATEGORIES.length; i++) modes[SPONSORBLOCK_CATEGORIES[i].id] = 'off';
+        modes.sponsor = 'auto';
+        return { enabled: true, showNotice: true, minimumDuration: 0, modes: modes, excludedChannels: [] };
+    }
+
+    function loadSponsorBlockSettings() {
+        if (sponsorBlockSettingsCache) return sponsorBlockSettingsCache;
+        var settings = defaultSponsorBlockSettings();
+        try {
+            var saved = JSON.parse(localStorage.getItem(SPONSORBLOCK_SETTINGS_KEY) || '{}');
+            if (typeof saved.enabled === 'boolean') settings.enabled = saved.enabled;
+            if (typeof saved.showNotice === 'boolean') settings.showNotice = saved.showNotice;
+            if (isFinite(saved.minimumDuration)) settings.minimumDuration = Math.max(0, Number(saved.minimumDuration));
+            if (Array.isArray(saved.excludedChannels)) settings.excludedChannels = saved.excludedChannels.filter(function (id) {
+                return typeof id === 'string' && id.length < 200;
+            }).slice(0, 200);
+            if (saved.modes) for (var id in settings.modes) {
+                if (saved.modes[id] === 'auto' || saved.modes[id] === 'ask' || saved.modes[id] === 'off') settings.modes[id] = saved.modes[id];
+            }
+        } catch (e) { /* use defaults */ }
+        sponsorBlockSettingsCache = settings;
+        return settings;
+    }
+
+    function saveSponsorBlockSettings(settings) {
+        sponsorBlockSettingsCache = settings;
+        try { localStorage.setItem(SPONSORBLOCK_SETTINGS_KEY, JSON.stringify(settings)); } catch (e) { /* ignore */ }
+        document.dispatchEvent(new CustomEvent('wblock-tc-sponsor-settings'));
+    }
+
+    function sponsorBlockVideoId() {
+        return youtubeVideoIdentity(findPlayer());
+    }
+
+    function sponsorBlockChannelId() {
+        try {
+            var details = window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.videoDetails;
+            if (details && details.channelId) return details.channelId;
+            var link = document.querySelector('#owner a[href*="/channel/"], #owner a[href^="/@"], ' +
+                'ytd-channel-name a[href], ytm-slim-owner-renderer a[href]');
+            if (link) return new URL(link.href, location.href).pathname;
+        } catch (e) { /* ignore */ }
+        return null;
+    }
+
+    function sponsorBlockChannelExcluded(settings) {
+        var channelId = sponsorBlockChannelId();
+        return !!(channelId && settings.excludedChannels.indexOf(channelId) !== -1);
+    }
+
+    function sponsorBlockCategoryName(category) {
+        var locale = sponsorBlockLocale();
+        for (var i = 0; i < SPONSORBLOCK_CATEGORIES.length; i++) {
+            if (SPONSORBLOCK_CATEGORIES[i].id === category) return locale.names[i];
+        }
+        return category;
+    }
+
+    function showSponsorBlockNotice(player, video, segment, ignored, action) {
+        var existing = player.querySelector('.wblock-tc-sponsor-notice');
+        if (existing) existing.remove();
+        var locale = sponsorBlockLocale();
+        var notice = document.createElement('div');
+        notice.className = 'wblock-tc-sponsor-notice';
+        // Keep the toast translucent so it never blots out the content under
+        // it; the blur keeps the label readable over bright video frames.
+        var noticePad = IS_IOS ? '7px 10px' : '9px 12px';
+        var noticeFont = IS_IOS ? '12px' : '13px';
+        notice.style.cssText = 'position:absolute;right:16px;top:16px;z-index:2147483647;' +
+            'display:flex;align-items:center;gap:10px;padding:' + noticePad + ';border-radius:9px;' +
+            'background:rgba(20,20,20,.55);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);' +
+            'color:#fff;font:' + noticeFont + ' -apple-system,BlinkMacSystemFont,sans-serif;' +
+            'box-shadow:0 3px 14px rgba(0,0,0,.25);pointer-events:auto;transition:opacity .3s';
+        var label = document.createElement('span');
+        label.textContent = sponsorBlockCategoryName(segment.category) + ' ' +
+            (action === 'undo' ? locale.skipped : locale.segment);
+        var actionButton = document.createElement('button');
+        actionButton.type = 'button';
+        actionButton.textContent = action === 'undo' ? locale.undo : locale.skip;
+        actionButton.style.cssText = 'border:0;background:transparent;color:#69a9ff;font:inherit;font-weight:600;' +
+            'padding:2px;cursor:pointer';
+        notice.appendChild(label);
+        notice.appendChild(actionButton);
+        player.appendChild(notice);
+        var fadeTimer = setTimeout(function () { notice.style.opacity = '0'; }, 3700);
+        var removeTimer = setTimeout(function () { if (notice.parentNode) notice.remove(); }, 4000);
+        actionButton.addEventListener('click', function () {
+            if (action === 'undo') {
+                ignored[segment.UUID || segment.segment.join(':')] = true;
+                try { video.currentTime = segment.segment[0] + 0.01; } catch (e) { /* ignore */ }
+            } else {
+                try { video.currentTime = segment.segment[1]; } catch (e) { /* ignore */ }
+            }
+            clearTimeout(fadeTimer);
+            clearTimeout(removeTimer);
+            notice.remove();
+        });
+        return function () { clearTimeout(fadeTimer); clearTimeout(removeTimer); if (notice.parentNode) notice.remove(); };
+    }
+
+    function setupSponsorBlock(player, video) {
+        var videoId = sponsorBlockVideoId();
+        if (!player || !video || !videoId || !window.crypto || !crypto.subtle || !window.fetch) return;
+        var cancelled = false;
+        var controller = null;
+        var requested = false;
+        var segments = [];
+        var ignored = {};
+        var notified = {};
+        var removeNotice = null;
+        var boundaryTimer = null;
+        var boundaryKey = null;
+        var timingSuspended = false;
+
+        function clearBoundaryTimer() {
+            if (boundaryTimer !== null) clearTimeout(boundaryTimer);
+            boundaryTimer = null;
+            boundaryKey = null;
+        }
+
+        function segmentState(item, settings) {
+            var key = item.UUID || item.category + ':' + item.segment.join(':');
+            var mode = settings.modes[item.category] || 'off';
+            var eligible = mode !== 'off' && !ignored[key] &&
+                (!item.actionType || item.actionType === 'skip') &&
+                item.segment[1] - item.segment[0] >= settings.minimumDuration;
+            return { key: key, mode: mode, eligible: eligible };
+        }
+
+        // Undo and ask-mode notification state lasts only until playback leaves
+        // that segment. Staying inside after Undo remains protected, while a
+        // later re-entry behaves like the first visit.
+        function clearExitedSegmentState(now) {
+            for (var i = 0; i < segments.length; i++) {
+                var item = segments[i];
+                if (now >= item.segment[0] && now < item.segment[1]) continue;
+                var key = item.UUID || item.category + ':' + item.segment.join(':');
+                delete ignored[key];
+                delete notified[key];
+            }
+        }
+
+        // Keep timeupdate as a throttling/background fallback, but normally arm
+        // one timer for the next segment boundary. This avoids waiting up to a
+        // full timeupdate interval before an automatic skip.
+        function scheduleNextBoundary(settings, now, force) {
+            if (cancelled || timingSuspended || video.seeking || video.paused || video.ended || !settings.enabled ||
+                sponsorBlockDisabledVideos[videoId] || sponsorBlockChannelExcluded(settings)) {
+                clearBoundaryTimer();
+                return;
+            }
+            var next = null;
+            var nextState = null;
+            for (var i = 0; i < segments.length; i++) {
+                var item = segments[i];
+                var state = segmentState(item, settings);
+                if (!state.eligible || state.mode === 'ask' && notified[state.key] || item.segment[0] <= now) continue;
+                next = item;
+                nextState = state;
+                break;
+            }
+            if (!next) { clearBoundaryTimer(); return; }
+            var key = nextState.key + '@' + next.segment[0] + ':' + video.playbackRate;
+            if (!force && boundaryTimer !== null && boundaryKey === key) return;
+            clearBoundaryTimer();
+            boundaryKey = key;
+            var rate = isFinite(video.playbackRate) && video.playbackRate > 0 ? video.playbackRate : 1;
+            var delay = Math.max(0, (next.segment[0] - now) * 1000 / rate + 8);
+            boundaryTimer = setTimeout(function () {
+                boundaryTimer = null;
+                boundaryKey = null;
+                onTimeUpdate();
+            }, Math.min(delay, 2147483647));
+        }
+
+        function onTimeUpdate(forceSchedule) {
+            if (timingSuspended || video.seeking) { clearBoundaryTimer(); return; }
+            var settings = loadSponsorBlockSettings();
+            if (!settings.enabled || sponsorBlockDisabledVideos[videoId] || sponsorBlockChannelExcluded(settings)) {
+                clearBoundaryTimer();
+                return;
+            }
+            var now = video.currentTime;
+            clearExitedSegmentState(now);
+            for (var i = 0; i < segments.length; i++) {
+                var item = segments[i];
+                var state = segmentState(item, settings);
+                if (!state.eligible) continue;
+                if (now >= item.segment[0] && now < item.segment[1] - 0.05) {
+                    if (state.mode === 'ask') {
+                        if (!notified[state.key]) {
+                            notified[state.key] = true;
+                            if (removeNotice) removeNotice();
+                            removeNotice = showSponsorBlockNotice(player, video, item, ignored, 'skip');
+                        }
+                        scheduleNextBoundary(settings, now, true);
+                        return;
+                    }
+                    try { video.currentTime = item.segment[1]; } catch (e) { return; }
+                    if (settings.showNotice) {
+                        if (removeNotice) removeNotice();
+                        removeNotice = showSponsorBlockNotice(player, video, item, ignored, 'undo');
+                    }
+                    scheduleNextBoundary(settings, item.segment[1], true);
+                    return;
+                }
+            }
+            scheduleNextBoundary(settings, now, !!forceSchedule);
+        }
+
+        function acceptBucket(bucket) {
+            var found = [];
+            if (Array.isArray(bucket)) for (var i = 0; i < bucket.length; i++) {
+                if (bucket[i].videoID === videoId && Array.isArray(bucket[i].segments)) {
+                    found = bucket[i].segments.filter(function (item) {
+                        return item && SPONSORBLOCK_CATEGORIES.some(function (category) { return category.id === item.category; }) &&
+                            Array.isArray(item.segment) && isFinite(item.segment[0]) && isFinite(item.segment[1]) &&
+                            item.segment[1] > item.segment[0];
+                    }).sort(function (a, b) { return a.segment[0] - b.segment[0]; });
+                    break;
+                }
+            }
+            segments = found;
+            cacheSponsorBlockSegments(videoId, found);
+            onTimeUpdate(true);
+        }
+
+        function loadSegments() {
+            var settings = loadSponsorBlockSettings();
+            if (requested || cancelled || !settings.enabled || sponsorBlockDisabledVideos[videoId] ||
+                sponsorBlockChannelExcluded(settings)) return;
+            var cached = cachedSponsorBlockSegments(videoId);
+            if (cached !== null) {
+                requested = true;
+                segments = cached;
+                onTimeUpdate(true);
+                return;
+            }
+            requested = true;
+            controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            crypto.subtle.digest('SHA-256', new TextEncoder().encode(videoId)).then(function (buffer) {
+                var bytes = new Uint8Array(buffer);
+                var hash = '';
+                var categoryIds = SPONSORBLOCK_CATEGORIES.map(function (category) { return category.id; });
+                for (var i = 0; i < bytes.length; i++) hash += ('0' + bytes[i].toString(16)).slice(-2);
+                var query = '?categories=' + encodeURIComponent(JSON.stringify(categoryIds)) +
+                    '&actionTypes=' + encodeURIComponent(JSON.stringify(['skip']));
+                return fetch(SPONSORBLOCK_API + hash.slice(0, 5) + query,
+                    controller ? { signal: controller.signal } : {});
+            }).then(function (response) {
+                if (!response.ok) return [];
+                return response.json();
+            }).then(function (bucket) {
+                if (!cancelled) acceptBucket(bucket);
+            }).catch(function (error) {
+                if (!cancelled && (!error || error.name !== 'AbortError')) log('SponsorBlock unavailable', error);
+            });
+        }
+
+        function onSettingsChange() {
+            if (removeNotice) { removeNotice(); removeNotice = null; }
+            loadSegments();
+            onTimeUpdate(true);
+        }
+        function onTimeUpdateEvent() { onTimeUpdate(false); }
+        function onPlaybackResumed() { timingSuspended = false; onTimeUpdate(true); }
+        function onPlaybackTimingChange() { onTimeUpdate(true); }
+        function suspendBoundaryTimer() { timingSuspended = true; clearBoundaryTimer(); }
+
+        // iOS fullscreen fallback. Entering the native full-screen player can
+        // stop dispatching timeupdate to the shared element (or leave the
+        // boundary timer suspended after a waiting/seeking burst), so a segment
+        // entered while full-screen plays through instead of skipping. A low-rate
+        // poll re-checks the timeline whenever the element is advancing, and the
+        // presentation/fullscreen transitions re-arm the boundary timer. The poll
+        // never forces a skip while a seek or stall is in progress.
+        var pollTimer = null;
+        function pollBoundary() {
+            if (cancelled || timingSuspended || video.seeking || video.paused || video.ended) { return; }
+            onTimeUpdate(false);
+        }
+        function startPoll() {
+            if (pollTimer !== null || !IS_IOS) { return; }
+            pollTimer = setInterval(pollBoundary, 300);
+        }
+        function stopPoll() {
+            if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+        }
+        function onFullscreenChange() {
+            timingSuspended = false;
+            onTimeUpdate(true);
+            startPoll();
+        }
+
+        video.addEventListener('timeupdate', onTimeUpdateEvent);
+        video.addEventListener('playing', onPlaybackResumed);
+        video.addEventListener('seeked', onPlaybackResumed);
+        video.addEventListener('ratechange', onPlaybackTimingChange);
+        video.addEventListener('seeking', suspendBoundaryTimer);
+        video.addEventListener('waiting', suspendBoundaryTimer);
+        video.addEventListener('stalled', suspendBoundaryTimer);
+        video.addEventListener('pause', clearBoundaryTimer);
+        video.addEventListener('ended', clearBoundaryTimer);
+        document.addEventListener('wblock-tc-sponsor-settings', onSettingsChange);
+        if (IS_IOS) {
+            video.addEventListener('webkitbeginfullscreen', onFullscreenChange);
+            video.addEventListener('webkitendfullscreen', onFullscreenChange);
+            document.addEventListener('fullscreenchange', onFullscreenChange);
+            document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+            startPoll();
+        }
+        registerCleanup(function () {
+            cancelled = true;
+            clearBoundaryTimer();
+            stopPoll();
+            video.removeEventListener('timeupdate', onTimeUpdateEvent);
+            video.removeEventListener('playing', onPlaybackResumed);
+            video.removeEventListener('seeked', onPlaybackResumed);
+            video.removeEventListener('ratechange', onPlaybackTimingChange);
+            video.removeEventListener('seeking', suspendBoundaryTimer);
+            video.removeEventListener('waiting', suspendBoundaryTimer);
+            video.removeEventListener('stalled', suspendBoundaryTimer);
+            video.removeEventListener('pause', clearBoundaryTimer);
+            video.removeEventListener('ended', clearBoundaryTimer);
+            document.removeEventListener('wblock-tc-sponsor-settings', onSettingsChange);
+            if (IS_IOS) {
+                video.removeEventListener('webkitbeginfullscreen', onFullscreenChange);
+                video.removeEventListener('webkitendfullscreen', onFullscreenChange);
+                document.removeEventListener('fullscreenchange', onFullscreenChange);
+                document.removeEventListener('webkitfullscreenchange', onFullscreenChange);
+            }
+            if (controller) controller.abort();
+            if (removeNotice) removeNotice();
+        });
+        loadSegments();
+    }
+
+    // ------------------------------------------------------------------
+    // DeArrow
+    //
+    // DeArrow stores voted replacement titles and thumbnail timestamps on the
+    // SponsorBlock server. The current watch video uses its four-character
+    // SHA-256 bucket so its exact id is filtered locally. Visible feed cards use
+    // DeArrow's compact single-video endpoint, matching the official extension,
+    // and are cached for the page session. An optional fallback uses DeArrow's
+    // server-provided random timestamp when a video has no accepted thumbnail.
+    // ------------------------------------------------------------------
+
+    var DEARROW_API = 'https://sponsor.ajay.app/api/branding';
+    var DEARROW_THUMBNAIL_API = 'https://dearrow-thumb.ajay.app/api/v1/getThumbnail';
+    var DEARROW_SETTINGS_KEY = 'wblock.tubeCleaner.deArrow';
+    var DEARROW_CARD_SELECTOR = [
+        'ytd-rich-grid-media', 'ytd-video-renderer', 'ytd-compact-video-renderer',
+        'ytd-grid-video-renderer', 'ytd-playlist-video-renderer', 'yt-lockup-view-model',
+        'ytm-video-with-context-renderer', 'ytm-compact-video-renderer',
+        'ytm-rich-item-renderer', 'ytm-shorts-lockup-view-model'
+    ].join(',');
+    var DEARROW_WATCH_TITLE_SELECTOR = [
+        'ytd-watch-metadata h1 yt-formatted-string',
+        '#watch-metadata h1 yt-formatted-string',
+        'ytm-slim-video-metadata-section-renderer h1',
+        'ytm-watch-metadata h1',
+        'h1.title yt-formatted-string'
+    ].join(',');
+    var deArrowSettingsCache = null;
+    var deArrowBrandingCache = {};
+    var deArrowBrandingCacheOrder = [];
+    var deArrowActiveRequests = {};
+    var deArrowIntersectionObserver = null;
+    var deArrowPendingScanRoots = [];
+    var deArrowScanScheduled = false;
+
+    function defaultDeArrowSettings() {
+        return {
+            enabled: false,
+            replaceTitles: true,
+            replaceThumbnails: true,
+            randomThumbnails: false,
+            showOriginalOnHover: true,
+            excludedChannels: []
+        };
+    }
+
+    function loadDeArrowSettings() {
+        if (deArrowSettingsCache) return deArrowSettingsCache;
+        var settings = defaultDeArrowSettings();
+        try {
+            var saved = JSON.parse(localStorage.getItem(DEARROW_SETTINGS_KEY) || '{}');
+            ['enabled', 'replaceTitles', 'replaceThumbnails', 'randomThumbnails', 'showOriginalOnHover'].forEach(function (key) {
+                if (typeof saved[key] === 'boolean') settings[key] = saved[key];
+            });
+            if (Array.isArray(saved.excludedChannels)) settings.excludedChannels = saved.excludedChannels.filter(function (id) {
+                return typeof id === 'string' && id.length < 200;
+            }).slice(0, 200);
+        } catch (e) { /* use defaults */ }
+        deArrowSettingsCache = settings;
+        return settings;
+    }
+
+    function saveDeArrowSettings(settings) {
+        deArrowSettingsCache = settings;
+        try { localStorage.setItem(DEARROW_SETTINGS_KEY, JSON.stringify(settings)); } catch (e) { /* ignore */ }
+        refreshDeArrowBranding();
+    }
+
+    function deArrowLocale() {
+        var language = (navigator.language || 'en').toLowerCase().split('-')[0];
+        var english = {
+            title: 'DeArrow settings', enabled: 'Enable DeArrow', titles: 'Replace titles',
+            thumbnails: 'Replace thumbnails', random: 'Use a random frame when no thumbnail is submitted',
+            hover: 'Show originals when hovering over a video', channel: 'Disable on this channel',
+            reset: 'Reset defaults', using: 'Using DeArrow'
+        };
+        var translations = {
+            de: { title:'DeArrow-Einstellungen',enabled:'DeArrow aktivieren',titles:'Titel ersetzen',thumbnails:'Vorschaubilder ersetzen',random:'Zufälliges Einzelbild verwenden, wenn kein Vorschaubild eingereicht wurde',hover:'Originale beim Bewegen über ein Video anzeigen',channel:'Auf diesem Kanal deaktivieren',reset:'Zurücksetzen',using:'Verwendet DeArrow' },
+            es: { title:'Ajustes de DeArrow',enabled:'Activar DeArrow',titles:'Sustituir títulos',thumbnails:'Sustituir miniaturas',random:'Usar un fotograma aleatorio si no se ha enviado una miniatura',hover:'Mostrar originales al pasar sobre un vídeo',channel:'Desactivar en este canal',reset:'Restablecer',using:'Usa DeArrow' },
+            fr: { title:'Réglages DeArrow',enabled:'Activer DeArrow',titles:'Remplacer les titres',thumbnails:'Remplacer les miniatures',random:'Utiliser une image aléatoire si aucune miniature n’a été proposée',hover:'Afficher les originaux au survol d’une vidéo',channel:'Désactiver sur cette chaîne',reset:'Réinitialiser',using:'Utilise DeArrow' },
+            it: { title:'Impostazioni DeArrow',enabled:'Attiva DeArrow',titles:'Sostituisci titoli',thumbnails:'Sostituisci miniature',random:'Usa un fotogramma casuale se non è stata inviata una miniatura',hover:'Mostra gli originali passando su un video',channel:'Disattiva su questo canale',reset:'Ripristina',using:'Usa DeArrow' },
+            pt: { title:'Configurações do DeArrow',enabled:'Ativar DeArrow',titles:'Substituir títulos',thumbnails:'Substituir miniaturas',random:'Usar um quadro aleatório quando nenhuma miniatura for enviada',hover:'Mostrar originais ao passar sobre um vídeo',channel:'Desativar neste canal',reset:'Restaurar padrões',using:'Usa DeArrow' },
+            ja: { title:'DeArrow設定',enabled:'DeArrowを有効にする',titles:'タイトルを置き換える',thumbnails:'サムネイルを置き換える',random:'サムネイルが投稿されていない場合はランダムなフレームを使う',hover:'動画にカーソルを合わせたとき元を表示',channel:'このチャンネルでは無効にする',reset:'初期設定に戻す',using:'DeArrowを使用' },
+            ko: { title:'DeArrow 설정',enabled:'DeArrow 활성화',titles:'제목 바꾸기',thumbnails:'미리보기 이미지 바꾸기',random:'제출된 미리보기가 없으면 임의의 프레임 사용',hover:'동영상 위에 마우스를 놓으면 원본 표시',channel:'이 채널에서 비활성화',reset:'기본값으로 재설정',using:'DeArrow 사용' },
+            ru: { title:'Настройки DeArrow',enabled:'Включить DeArrow',titles:'Заменять названия',thumbnails:'Заменять значки',random:'Использовать случайный кадр, если миниатюра не предложена',hover:'Показывать оригиналы при наведении на видео',channel:'Отключить на этом канале',reset:'Сбросить',using:'Использует DeArrow' },
+            zh: { title:'DeArrow 设置',enabled:'启用 DeArrow',titles:'替换标题',thumbnails:'替换缩略图',random:'没有提交缩略图时使用随机画面',hover:'悬停视频时显示原始内容',channel:'对这个频道停用',reset:'恢复默认设置',using:'使用 DeArrow' }
+        };
+        return translations[language] || english;
+    }
+
+    function cachedDeArrowBranding(videoId) {
+        return Object.prototype.hasOwnProperty.call(deArrowBrandingCache, videoId) ?
+            deArrowBrandingCache[videoId] : undefined;
+    }
+
+    function cacheDeArrowBranding(videoId, branding) {
+        if (!Object.prototype.hasOwnProperty.call(deArrowBrandingCache, videoId)) {
+            deArrowBrandingCacheOrder.push(videoId);
+        }
+        deArrowBrandingCache[videoId] = branding;
+        while (deArrowBrandingCacheOrder.length > 100) {
+            delete deArrowBrandingCache[deArrowBrandingCacheOrder.shift()];
+        }
+    }
+
+    function normalizeDeArrowBranding(value) {
+        if (!value || typeof value !== 'object') return null;
+        return {
+            titles: Array.isArray(value.titles) ? value.titles : [],
+            thumbnails: Array.isArray(value.thumbnails) ? value.thumbnails : [],
+            videoDuration: isFinite(value.videoDuration) && Number(value.videoDuration) > 0 ? Number(value.videoDuration) : null,
+            randomTime: value.randomTime !== null && value.randomTime !== undefined && isFinite(value.randomTime) &&
+                Number(value.randomTime) >= 0 ? Number(value.randomTime) : null
+        };
+    }
+
+    function fetchDeArrowBranding(videoId, hashLookup) {
+        var cached = cachedDeArrowBranding(videoId);
+        if (cached !== undefined) return Promise.resolve(cached);
+        if (deArrowActiveRequests[videoId]) return deArrowActiveRequests[videoId];
+        if (!window.fetch) return Promise.resolve(null);
+
+        var request;
+        if (hashLookup && window.crypto && crypto.subtle && window.TextEncoder) {
+            request = crypto.subtle.digest('SHA-256', new TextEncoder().encode(videoId)).then(function (buffer) {
+                var bytes = new Uint8Array(buffer);
+                var hash = '';
+                for (var i = 0; i < bytes.length; i++) hash += ('0' + bytes[i].toString(16)).slice(-2);
+                return fetch(DEARROW_API + '/' + hash.slice(0, 4) + '?fetchAll=true', { referrerPolicy: 'no-referrer' });
+            }).then(function (response) {
+                if (!response.ok && response.status !== 404) throw new Error('DeArrow HTTP ' + response.status);
+                return response.json();
+            }).then(function (bucket) {
+                return normalizeDeArrowBranding(bucket && bucket[videoId]);
+            });
+        } else {
+            request = fetch(DEARROW_API + '?videoID=' + encodeURIComponent(videoId) + '&fetchAll=true', {
+                referrerPolicy: 'no-referrer'
+            }).then(function (response) {
+                if (!response.ok && response.status !== 404) throw new Error('DeArrow HTTP ' + response.status);
+                return response.json();
+            }).then(normalizeDeArrowBranding);
+        }
+        deArrowActiveRequests[videoId] = request.then(function (branding) {
+            cacheDeArrowBranding(videoId, branding);
+            delete deArrowActiveRequests[videoId];
+            return branding;
+        }, function (error) {
+            delete deArrowActiveRequests[videoId];
+            log('DeArrow unavailable', error);
+            return null;
+        });
+        return deArrowActiveRequests[videoId];
+    }
+
+    function deArrowAcceptedTitle(branding) {
+        var title = branding && branding.titles[0];
+        return title && title.original !== true && typeof title.title === 'string' && title.title.trim() &&
+            (title.locked || Number(title.votes) >= 0) ? title.title.replace(/‹/g, '<') : null;
+    }
+
+    function deArrowAcceptedThumbnail(branding) {
+        var thumbnail = branding && branding.thumbnails[0];
+        return thumbnail && thumbnail.original !== true && isFinite(thumbnail.timestamp) && thumbnail.timestamp >= 0 &&
+            (thumbnail.locked || Number(thumbnail.votes) >= 0) ? Number(thumbnail.timestamp) : null;
+    }
+
+    // DeArrow supplies a stable randomTime when it has one. The deterministic
+    // fallback avoids a thumbnail changing on every scan for older responses.
+    function deArrowRandomThumbnailTimestamp(videoId, branding) {
+        if (!branding || !isFinite(branding.videoDuration) || branding.videoDuration <= 0) return null;
+        var fraction = branding.randomTime;
+        if (!isFinite(fraction) || fraction < 0) {
+            var hash = 2166136261;
+            for (var i = 0; i < videoId.length; i++) {
+                hash ^= videoId.charCodeAt(i);
+                hash = Math.imul(hash, 16777619);
+            }
+            fraction = (hash >>> 0) / 4294967296;
+        }
+        // Match DeArrow's policy of keeping fallback frames out of the ending.
+        fraction = Math.min(Math.max(Number(fraction), 0), 0.9);
+        return fraction * branding.videoDuration;
+    }
+
+    function deArrowVideoIdFromUrl(value) {
+        try {
+            var url = new URL(value, location.href);
+            var id = url.searchParams.get('v');
+            if (!id) {
+                var match = url.pathname.match(/^\/(?:shorts|embed)\/([A-Za-z0-9_-]{11})/);
+                id = match && match[1];
+            }
+            return id && /^[A-Za-z0-9_-]{11}$/.test(id) ? id : null;
+        } catch (e) { return null; }
+    }
+
+    function deArrowCardVideoId(card) {
+        var direct = card.getAttribute('data-video-id');
+        if (direct && /^[A-Za-z0-9_-]{11}$/.test(direct)) return direct;
+        var links = card.querySelectorAll('a[href], [href]');
+        for (var i = 0; i < links.length; i++) {
+            var id = deArrowVideoIdFromUrl(links[i].getAttribute('href'));
+            if (id) return id;
+        }
+        return null;
+    }
+
+    function deArrowCardChannelId(card) {
+        var direct = card.getAttribute('data-channel-id');
+        if (direct) return direct;
+        var link = card.querySelector('a[href^="/@"],a[href^="/channel/"],a[href^="/c/"],a[href^="/user/"]');
+        if (!link) return null;
+        try { return new URL(link.getAttribute('href'), location.href).pathname; }
+        catch (e) { return null; }
+    }
+
+    function deArrowChannelExcluded(settings, channelId) {
+        return !!(channelId && settings.excludedChannels.indexOf(channelId) !== -1);
+    }
+
+    function findDeArrowCardTitle(card) {
+        var selectors = [
+            '#video-title yt-formatted-string', 'yt-formatted-string#video-title',
+            'a#video-title-link yt-formatted-string', 'a#video-title-link', 'a#video-title',
+            '.yt-lockup-metadata-view-model__title span', '.yt-lockup-metadata-view-model__title',
+            '.media-item-headline', 'h3 a[href]'
+        ];
+        for (var i = 0; i < selectors.length; i++) {
+            var element = card.querySelector(selectors[i]);
+            if (element) return element;
+        }
+        return null;
+    }
+
+    function findDeArrowCardThumbnail(card, videoId) {
+        var links = card.querySelectorAll('a[href]');
+        for (var i = 0; i < links.length; i++) {
+            if (deArrowVideoIdFromUrl(links[i].getAttribute('href')) === videoId) {
+                var image = links[i].querySelector('img');
+                if (image) return image;
+            }
+        }
+        return card.querySelector('#thumbnail img, ytm-thumbnail-cover img, img.yt-core-image');
+    }
+
+    function applyDeArrowTitleElement(element, customTitle) {
+        if (!element) return;
+        var current = element.textContent || '';
+        if (element._wblockDeArrowOriginalText === undefined ||
+            current !== element._wblockDeArrowCustomText && current !== element._wblockDeArrowOriginalText) {
+            element._wblockDeArrowOriginalText = current;
+        }
+        element._wblockDeArrowCustomText = customTitle;
+        element.setAttribute('data-wblock-dearrow-title', '');
+        if (!element._wblockDeArrowShowingOriginal && current !== customTitle) element.textContent = customTitle;
+    }
+
+    function restoreDeArrowTitleElement(element) {
+        if (!element || element._wblockDeArrowOriginalText === undefined) return;
+        if (element.textContent === element._wblockDeArrowCustomText) {
+            element.textContent = element._wblockDeArrowOriginalText;
+        }
+        delete element._wblockDeArrowOriginalText;
+        delete element._wblockDeArrowCustomText;
+        delete element._wblockDeArrowShowingOriginal;
+        element.removeAttribute('data-wblock-dearrow-title');
+    }
+
+    function restoreDeArrowAttribute(element, name, value) {
+        if (value === null || value === undefined) element.removeAttribute(name);
+        else element.setAttribute(name, value);
+    }
+
+    function applyDeArrowThumbnailElement(element, videoId, timestamp) {
+        if (!element) return;
+        var url = DEARROW_THUMBNAIL_API + '?videoID=' + encodeURIComponent(videoId) +
+            '&time=' + encodeURIComponent(String(timestamp));
+        if (element._wblockDeArrowOriginalSrc === undefined) {
+            element._wblockDeArrowOriginalSrc = element.getAttribute('src');
+            element._wblockDeArrowOriginalSrcset = element.getAttribute('srcset');
+            element._wblockDeArrowOriginalReferrerPolicy = element.getAttribute('referrerpolicy');
+        } else if (!element._wblockDeArrowShowingOriginal && element.getAttribute('src') !== url &&
+            element.getAttribute('src') !== element._wblockDeArrowOriginalSrc) {
+            // YouTube recycles card image elements as the feed changes. Preserve
+            // its newly assigned original before applying the cached thumbnail.
+            element._wblockDeArrowOriginalSrc = element.getAttribute('src');
+            element._wblockDeArrowOriginalSrcset = element.getAttribute('srcset');
+            element._wblockDeArrowOriginalReferrerPolicy = element.getAttribute('referrerpolicy');
+            delete element._wblockDeArrowThumbnailFailed;
+        }
+        element._wblockDeArrowCustomSrc = url;
+        element.setAttribute('data-wblock-dearrow-thumbnail', '');
+        if (element._wblockDeArrowThumbnailFailed === url || element._wblockDeArrowShowingOriginal) return;
+        element.removeAttribute('srcset');
+        element.setAttribute('referrerpolicy', 'no-referrer');
+        if (element.getAttribute('src') !== url) element.setAttribute('src', url);
+        if (!element._wblockDeArrowErrorHooked) {
+            element._wblockDeArrowErrorHooked = true;
+            element.addEventListener('error', function () {
+                if (element.getAttribute('src') !== element._wblockDeArrowCustomSrc) return;
+                element._wblockDeArrowThumbnailFailed = element._wblockDeArrowCustomSrc;
+                restoreDeArrowAttribute(element, 'src', element._wblockDeArrowOriginalSrc);
+                restoreDeArrowAttribute(element, 'srcset', element._wblockDeArrowOriginalSrcset);
+                restoreDeArrowAttribute(element, 'referrerpolicy', element._wblockDeArrowOriginalReferrerPolicy);
+            });
+        }
+    }
+
+    function restoreDeArrowThumbnailElement(element) {
+        if (!element || element._wblockDeArrowOriginalSrc === undefined) return;
+        restoreDeArrowAttribute(element, 'src', element._wblockDeArrowOriginalSrc);
+        restoreDeArrowAttribute(element, 'srcset', element._wblockDeArrowOriginalSrcset);
+        restoreDeArrowAttribute(element, 'referrerpolicy', element._wblockDeArrowOriginalReferrerPolicy);
+        delete element._wblockDeArrowOriginalSrc;
+        delete element._wblockDeArrowOriginalSrcset;
+        delete element._wblockDeArrowOriginalReferrerPolicy;
+        delete element._wblockDeArrowCustomSrc;
+        delete element._wblockDeArrowThumbnailFailed;
+        delete element._wblockDeArrowShowingOriginal;
+        element.removeAttribute('data-wblock-dearrow-thumbnail');
+    }
+
+    function installDeArrowHover(card) {
+        if (card._wblockDeArrowHoverInstalled) return;
+        card._wblockDeArrowHoverInstalled = true;
+        card._wblockDeArrowMouseEnter = function () {
+            if (!loadDeArrowSettings().showOriginalOnHover) return;
+            card._wblockDeArrowShowingOriginal = true;
+            var title = card._wblockDeArrowTitleElement;
+            var image = card._wblockDeArrowThumbnailElement;
+            if (title && title._wblockDeArrowOriginalText !== undefined) {
+                title._wblockDeArrowShowingOriginal = true;
+                title.textContent = title._wblockDeArrowOriginalText;
+            }
+            if (image && image._wblockDeArrowOriginalSrc !== undefined) {
+                image._wblockDeArrowShowingOriginal = true;
+                restoreDeArrowAttribute(image, 'src', image._wblockDeArrowOriginalSrc);
+                restoreDeArrowAttribute(image, 'srcset', image._wblockDeArrowOriginalSrcset);
+                restoreDeArrowAttribute(image, 'referrerpolicy', image._wblockDeArrowOriginalReferrerPolicy);
+            }
+        };
+        card._wblockDeArrowMouseLeave = function () {
+            card._wblockDeArrowShowingOriginal = false;
+            var settings = loadDeArrowSettings();
+            if (!settings.enabled || deArrowChannelExcluded(settings, deArrowCardChannelId(card))) return;
+            var title = card._wblockDeArrowTitleElement;
+            var image = card._wblockDeArrowThumbnailElement;
+            if (title) {
+                title._wblockDeArrowShowingOriginal = false;
+                if (settings.replaceTitles && title._wblockDeArrowCustomText) title.textContent = title._wblockDeArrowCustomText;
+            }
+            if (image) {
+                image._wblockDeArrowShowingOriginal = false;
+                if (settings.replaceThumbnails && image._wblockDeArrowCustomSrc &&
+                    image._wblockDeArrowThumbnailFailed !== image._wblockDeArrowCustomSrc) {
+                    image.removeAttribute('srcset');
+                    image.setAttribute('referrerpolicy', 'no-referrer');
+                    image.setAttribute('src', image._wblockDeArrowCustomSrc);
+                }
+            }
+        };
+        card.addEventListener('mouseenter', card._wblockDeArrowMouseEnter);
+        card.addEventListener('mouseleave', card._wblockDeArrowMouseLeave);
+    }
+
+    function restoreDeArrowCard(card) {
+        if (!card) return;
+        restoreDeArrowTitleElement(card._wblockDeArrowTitleElement);
+        restoreDeArrowThumbnailElement(card._wblockDeArrowThumbnailElement);
+        if (card._wblockDeArrowHoverInstalled) {
+            card.removeEventListener('mouseenter', card._wblockDeArrowMouseEnter);
+            card.removeEventListener('mouseleave', card._wblockDeArrowMouseLeave);
+        }
+        delete card._wblockDeArrowTitleElement;
+        delete card._wblockDeArrowThumbnailElement;
+        delete card._wblockDeArrowHoverInstalled;
+        delete card._wblockDeArrowMouseEnter;
+        delete card._wblockDeArrowMouseLeave;
+        delete card._wblockDeArrowShowingOriginal;
+        delete card._wblockDeArrowObserved;
+        delete card._wblockDeArrowRequestedVideoId;
+        delete card._wblockDeArrowProcessedVideoId;
+        card.removeAttribute('data-wblock-dearrow-card');
+    }
+
+    function applyDeArrowCard(card) {
+        var videoId = deArrowCardVideoId(card);
+        if (!videoId) return;
+        if (card._wblockDeArrowRequestedVideoId && card._wblockDeArrowRequestedVideoId !== videoId) {
+            restoreDeArrowCard(card);
+        }
+        var settings = loadDeArrowSettings();
+        if (!settings.enabled || deArrowChannelExcluded(settings, deArrowCardChannelId(card))) {
+            restoreDeArrowCard(card);
+            return;
+        }
+        card._wblockDeArrowRequestedVideoId = videoId;
+        card.setAttribute('data-wblock-dearrow-card', '');
+        fetchDeArrowBranding(videoId, false).then(function (branding) {
+            if (!card.isConnected || card._wblockDeArrowRequestedVideoId !== videoId) return;
+            var currentSettings = loadDeArrowSettings();
+            if (!currentSettings.enabled || deArrowChannelExcluded(currentSettings, deArrowCardChannelId(card))) {
+                restoreDeArrowCard(card);
+                return;
+            }
+            var customTitle = deArrowAcceptedTitle(branding);
+            var customTimestamp = deArrowAcceptedThumbnail(branding);
+            if (customTimestamp === null && currentSettings.randomThumbnails) {
+                customTimestamp = deArrowRandomThumbnailTimestamp(videoId, branding);
+            }
+            var titleElement = findDeArrowCardTitle(card);
+            var thumbnailElement = findDeArrowCardThumbnail(card, videoId);
+            if (currentSettings.replaceTitles && customTitle) {
+                card._wblockDeArrowTitleElement = titleElement;
+                applyDeArrowTitleElement(titleElement, customTitle);
+            } else {
+                restoreDeArrowTitleElement(card._wblockDeArrowTitleElement);
+                delete card._wblockDeArrowTitleElement;
+            }
+            if (currentSettings.replaceThumbnails && customTimestamp !== null) {
+                card._wblockDeArrowThumbnailElement = thumbnailElement;
+                applyDeArrowThumbnailElement(thumbnailElement, videoId, customTimestamp);
+            } else {
+                restoreDeArrowThumbnailElement(card._wblockDeArrowThumbnailElement);
+                delete card._wblockDeArrowThumbnailElement;
+            }
+            if (card._wblockDeArrowTitleElement || card._wblockDeArrowThumbnailElement) installDeArrowHover(card);
+            card._wblockDeArrowProcessedVideoId = videoId;
+        });
+    }
+
+    function queueDeArrowCard(card) {
+        if (!card || card._wblockDeArrowShowingOriginal) return;
+        var videoId = deArrowCardVideoId(card);
+        if (!videoId) return;
+        if (card._wblockDeArrowProcessedVideoId === videoId) {
+            var title = card._wblockDeArrowTitleElement;
+            var image = card._wblockDeArrowThumbnailElement;
+            var titleNeedsRepair = title && title._wblockDeArrowCustomText &&
+                title.textContent !== title._wblockDeArrowCustomText;
+            var imageNeedsRepair = image && image._wblockDeArrowCustomSrc &&
+                image._wblockDeArrowThumbnailFailed !== image._wblockDeArrowCustomSrc &&
+                image.getAttribute('src') !== image._wblockDeArrowCustomSrc;
+            if (!titleNeedsRepair && !imageNeedsRepair) return;
+            applyDeArrowCard(card);
+            return;
+        }
+        if (card._wblockDeArrowRequestedVideoId === videoId && card._wblockDeArrowObserved) return;
+        if (typeof IntersectionObserver === 'undefined') {
+            applyDeArrowCard(card);
+            return;
+        }
+        if (!deArrowIntersectionObserver) {
+            deArrowIntersectionObserver = new IntersectionObserver(function (entries) {
+                entries.forEach(function (entry) {
+                    if (!entry.isIntersecting) return;
+                    try { deArrowIntersectionObserver.unobserve(entry.target); } catch (e) { /* ignore */ }
+                    entry.target._wblockDeArrowObserved = false;
+                    applyDeArrowCard(entry.target);
+                });
+            }, { rootMargin: '240px 0px', threshold: 0.01 });
+        }
+        if (!card._wblockDeArrowObserved) {
+            card._wblockDeArrowObserved = true;
+            card._wblockDeArrowRequestedVideoId = videoId;
+            card.setAttribute('data-wblock-dearrow-card', '');
+            deArrowIntersectionObserver.observe(card);
+        }
+    }
+
+    function applyCurrentDeArrowTitle() {
+        var settings = loadDeArrowSettings();
+        var videoId = sponsorBlockVideoId();
+        var channelId = sponsorBlockChannelId();
+        if (!settings.enabled || !settings.replaceTitles || !videoId || deArrowChannelExcluded(settings, channelId)) return;
+        fetchDeArrowBranding(videoId, true).then(function (branding) {
+            var currentSettings = loadDeArrowSettings();
+            if (!currentSettings.enabled || !currentSettings.replaceTitles || sponsorBlockVideoId() !== videoId ||
+                deArrowChannelExcluded(currentSettings, sponsorBlockChannelId())) return;
+            var customTitle = deArrowAcceptedTitle(branding);
+            if (!customTitle) return;
+            var titles = document.querySelectorAll(DEARROW_WATCH_TITLE_SELECTOR);
+            for (var i = 0; i < titles.length; i++) applyDeArrowTitleElement(titles[i], customTitle);
+        });
+    }
+
+    function scanForDeArrow(root) {
+        var settings = loadDeArrowSettings();
+        if (!settings.enabled || !root) return;
+        applyCurrentDeArrowTitle();
+        var cards = [];
+        if (root.nodeType === 1) {
+            try {
+                if (root.matches(DEARROW_CARD_SELECTOR)) cards.push(root);
+                var closest = root.closest(DEARROW_CARD_SELECTOR);
+                if (closest && cards.indexOf(closest) === -1) cards.push(closest);
+            } catch (e) { /* ignore */ }
+        }
+        if (root.querySelectorAll) {
+            var nested = root.querySelectorAll(DEARROW_CARD_SELECTOR);
+            for (var i = 0; i < nested.length; i++) if (cards.indexOf(nested[i]) === -1) cards.push(nested[i]);
+        }
+        for (var j = 0; j < cards.length; j++) queueDeArrowCard(cards[j]);
+    }
+
+    function scheduleDeArrowScan(root) {
+        if (!loadDeArrowSettings().enabled) return;
+        if (root === document) deArrowPendingScanRoots = [document];
+        else if (deArrowPendingScanRoots.indexOf(document) === -1 && root && deArrowPendingScanRoots.indexOf(root) === -1) {
+            deArrowPendingScanRoots.push(root);
+            if (deArrowPendingScanRoots.length > 40) deArrowPendingScanRoots = [document];
+        }
+        if (deArrowScanScheduled) return;
+        deArrowScanScheduled = true;
+        Promise.resolve().then(function () {
+            deArrowScanScheduled = false;
+            var roots = deArrowPendingScanRoots;
+            deArrowPendingScanRoots = [];
+            for (var i = 0; i < roots.length; i++) {
+                if (roots[i] === document || roots[i].isConnected) scanForDeArrow(roots[i]);
+            }
+        });
+    }
+
+    function restoreAllDeArrowBranding() {
+        if (deArrowIntersectionObserver) {
+            try { deArrowIntersectionObserver.disconnect(); } catch (e) { /* ignore */ }
+            deArrowIntersectionObserver = null;
+        }
+        var cards = document.querySelectorAll('[data-wblock-dearrow-card]');
+        for (var i = 0; i < cards.length; i++) restoreDeArrowCard(cards[i]);
+        var titles = document.querySelectorAll('[data-wblock-dearrow-title]');
+        for (var j = 0; j < titles.length; j++) restoreDeArrowTitleElement(titles[j]);
+        var thumbnails = document.querySelectorAll('[data-wblock-dearrow-thumbnail]');
+        for (var k = 0; k < thumbnails.length; k++) restoreDeArrowThumbnailElement(thumbnails[k]);
+    }
+
+    function refreshDeArrowBranding() {
+        restoreAllDeArrowBranding();
+        if (loadDeArrowSettings().enabled) scheduleDeArrowScan(document);
     }
 
     // ------------------------------------------------------------------
@@ -2779,8 +3749,13 @@
 
         qualityBtn.addEventListener('click', function (e) {
             e.stopPropagation();
-            if (qualityMenu) {
-                qualityMenu.style.display = 'none';
+            if (sponsorMenu) {
+                sponsorMenu.style.display = 'none';
+                if (sponsorBtn) sponsorBtn.setAttribute('aria-expanded', 'false');
+            }
+            if (deArrowMenu) {
+                deArrowMenu.style.display = 'none';
+                if (deArrowBtn) deArrowBtn.setAttribute('aria-expanded', 'false');
             }
             if (qualityMenu.style.display === 'none') {
                 buildQualityMenu();
@@ -2840,7 +3815,348 @@
         });
         if (!IS_IOS) { playbackRow.appendChild(audioBtn); }
 
-        // PiP button is intentionally omitted
+        // SponsorBlock settings. This mirrors SponsorBlock's familiar category
+        // colors and Auto / Show button / Disabled choices without importing
+        // its extension-only React, chrome.storage, voting, and submission UI.
+        var sponsorWrap = document.createElement('div');
+        sponsorWrap.style.cssText = 'position:relative';
+        var sponsorBtn = document.createElement('button');
+        sponsorBtn.className = 'wblock-tc-sponsor-button';
+        sponsorBtn.type = 'button';
+        sponsorBtn.style.cssText = btnStyle;
+        sponsorBtn.textContent = 'SB';
+        sponsorBtn.setAttribute('aria-haspopup', 'dialog');
+        sponsorBtn.setAttribute('aria-expanded', 'false');
+        var sponsorMenu = document.createElement('div');
+        sponsorMenu.className = 'wblock-tc-sponsor-menu';
+        sponsorMenu.setAttribute('role', 'dialog');
+        sponsorMenu.setAttribute('aria-label', sponsorBlockLocale().title);
+        sponsorMenu.style.cssText = 'position:absolute;bottom:100%;right:0;margin-bottom:6px;box-sizing:border-box;' +
+            'width:' + (IS_IOS ? 'min(340px,calc(100vw - 16px))' : '310px') + ';max-height:65vh;overflow:auto;' +
+            'background:rgba(22,22,24,.98);border:1px solid rgba(255,255,255,.14);border-radius:10px;' +
+            'padding:12px;color:#fff;display:none;z-index:80;font:' + (IS_IOS ? '14px' : '12px') +
+            '/1.35 -apple-system,system-ui,sans-serif;box-shadow:0 8px 28px rgba(0,0,0,.45);text-align:left';
+
+        function updateSponsorButton() {
+            var buttonSettings = loadSponsorBlockSettings();
+            var enabled = buttonSettings.enabled && !sponsorBlockDisabledVideos[sponsorBlockVideoId()] &&
+                !sponsorBlockChannelExcluded(buttonSettings);
+            sponsorBtn.style.color = enabled ? '#00d400' : '#aaa';
+            sponsorBtn.title = sponsorBlockLocale().title;
+            sponsorBtn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+        }
+
+        function sponsorCheckboxRow(labelText, checked, onChange) {
+            var label = document.createElement('label');
+            label.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 0;cursor:pointer';
+            var input = document.createElement('input');
+            input.type = 'checkbox';
+            input.checked = checked;
+            input.style.cssText = 'width:16px;height:16px;accent-color:#00d400';
+            input.addEventListener('change', function () { onChange(input.checked); });
+            var text = document.createElement('span');
+            text.textContent = labelText;
+            label.appendChild(input);
+            label.appendChild(text);
+            return label;
+        }
+
+        function buildSponsorMenu() {
+            while (sponsorMenu.firstChild) sponsorMenu.removeChild(sponsorMenu.firstChild);
+            var locale = sponsorBlockLocale();
+            var settings = loadSponsorBlockSettings();
+            var heading = document.createElement('div');
+            heading.textContent = 'SponsorBlock';
+            heading.style.cssText = 'font-size:' + (IS_IOS ? '18px' : '15px') + ';font-weight:700;margin:0 0 7px';
+            sponsorMenu.appendChild(heading);
+            sponsorMenu.appendChild(sponsorCheckboxRow(locale.enabled, settings.enabled, function (checked) {
+                settings.enabled = checked;
+                saveSponsorBlockSettings(settings);
+                updateSponsorButton();
+                buildSponsorMenu();
+            }));
+
+            var divider = document.createElement('div');
+            divider.style.cssText = 'height:1px;background:rgba(255,255,255,.12);margin:5px 0';
+            sponsorMenu.appendChild(divider);
+            for (var i = 0; i < SPONSORBLOCK_CATEGORIES.length; i++) {
+                (function (category, index) {
+                    var row = document.createElement('label');
+                    row.style.cssText = 'display:grid;grid-template-columns:10px 1fr auto;align-items:center;gap:8px;padding:5px 0';
+                    var color = document.createElement('span');
+                    color.style.cssText = 'width:9px;height:9px;border-radius:2px;background:' + category.color;
+                    var name = document.createElement('span');
+                    name.textContent = locale.names[index];
+                    var select = document.createElement('select');
+                    select.setAttribute('data-sponsor-category', category.id);
+                    select.style.cssText = 'max-width:' + (IS_IOS ? '150px' : '125px') + ';background:#353538;color:#fff;' +
+                        'border:1px solid #5b5b60;border-radius:5px;padding:' + (IS_IOS ? '7px 5px' : '3px 4px') + ';font:inherit';
+                    [['auto', locale.auto], ['ask', locale.ask], ['off', locale.off]].forEach(function (optionData) {
+                        var option = document.createElement('option');
+                        option.value = optionData[0];
+                        option.textContent = optionData[1];
+                        select.appendChild(option);
+                    });
+                    select.value = settings.modes[category.id];
+                    select.disabled = !settings.enabled;
+                    select.addEventListener('change', function () {
+                        settings.modes[category.id] = select.value;
+                        saveSponsorBlockSettings(settings);
+                    });
+                    row.appendChild(color); row.appendChild(name); row.appendChild(select);
+                    sponsorMenu.appendChild(row);
+                })(SPONSORBLOCK_CATEGORIES[i], i);
+            }
+
+            var optionsDivider = divider.cloneNode(false);
+            sponsorMenu.appendChild(optionsDivider);
+            sponsorMenu.appendChild(sponsorCheckboxRow(locale.notice, settings.showNotice, function (checked) {
+                settings.showNotice = checked;
+                saveSponsorBlockSettings(settings);
+            }));
+            // Whole-toolbar visibility preference. It lives here because this
+            // is the only settings surface Tube Cleaner has; it hides the
+            // quality, SB, and DA pills together on this device.
+            sponsorMenu.appendChild(sponsorCheckboxRow(locale.hideControls, isToolbarHidden(), function (checked) {
+                setToolbarHidden(checked);
+            }));
+            var durationRow = document.createElement('label');
+            durationRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 0';
+            var durationLabel = document.createElement('span');
+            durationLabel.textContent = locale.duration;
+            var durationSelect = document.createElement('select');
+            durationSelect.style.cssText = 'background:#353538;color:#fff;border:1px solid #5b5b60;border-radius:5px;padding:3px 4px;font:inherit';
+            [[0, locale.any], [1, '1 s'], [2, '2 s'], [5, '5 s'], [10, '10 s']].forEach(function (value) {
+                var option = document.createElement('option'); option.value = value[0]; option.textContent = value[1];
+                durationSelect.appendChild(option);
+            });
+            durationSelect.value = String(settings.minimumDuration);
+            durationSelect.addEventListener('change', function () {
+                settings.minimumDuration = Number(durationSelect.value);
+                saveSponsorBlockSettings(settings);
+            });
+            durationRow.appendChild(durationLabel); durationRow.appendChild(durationSelect);
+            sponsorMenu.appendChild(durationRow);
+
+            var currentId = sponsorBlockVideoId();
+            sponsorMenu.appendChild(sponsorCheckboxRow(locale.current, !!sponsorBlockDisabledVideos[currentId], function (checked) {
+                if (checked) sponsorBlockDisabledVideos[currentId] = true;
+                else delete sponsorBlockDisabledVideos[currentId];
+                document.dispatchEvent(new CustomEvent('wblock-tc-sponsor-settings'));
+                updateSponsorButton();
+            }));
+            var channelId = sponsorBlockChannelId();
+            if (channelId) {
+                var channelRow = sponsorCheckboxRow(locale.channel,
+                    settings.excludedChannels.indexOf(channelId) !== -1, function (checked) {
+                        var index = settings.excludedChannels.indexOf(channelId);
+                        if (checked && index === -1) settings.excludedChannels.push(channelId);
+                        if (!checked && index !== -1) settings.excludedChannels.splice(index, 1);
+                        saveSponsorBlockSettings(settings);
+                        updateSponsorButton();
+                    });
+                channelRow.setAttribute('data-sponsor-channel', channelId);
+                sponsorMenu.appendChild(channelRow);
+            }
+            var footer = document.createElement('div');
+            footer.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-top:8px;padding-top:8px;' +
+                'border-top:1px solid rgba(255,255,255,.12)';
+            var reset = document.createElement('button');
+            reset.type = 'button'; reset.textContent = locale.reset;
+            reset.style.cssText = 'background:transparent;color:#aaa;border:0;padding:3px 0;font:inherit;cursor:pointer';
+            reset.addEventListener('click', function () {
+                sponsorBlockSettingsCache = defaultSponsorBlockSettings();
+                saveSponsorBlockSettings(sponsorBlockSettingsCache);
+                updateSponsorButton();
+                buildSponsorMenu();
+            });
+            var credit = document.createElement('a');
+            credit.href = 'https://sponsor.ajay.app/'; credit.target = '_blank'; credit.rel = 'noopener noreferrer';
+            credit.textContent = locale.using; credit.style.cssText = 'color:#69a9ff;text-decoration:none';
+            footer.appendChild(reset); footer.appendChild(credit); sponsorMenu.appendChild(footer);
+        }
+
+        sponsorBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            qualityMenu.style.display = 'none';
+            if (deArrowMenu) {
+                deArrowMenu.style.display = 'none';
+                if (deArrowBtn) deArrowBtn.setAttribute('aria-expanded', 'false');
+            }
+            if (sponsorMenu.style.display === 'none') {
+                buildSponsorMenu();
+                // SB sits left of DA in the service row; align its panel with
+                // the row's right edge so the wider desktop panel stays on-screen.
+                if (IS_IOS) {
+                    showMobilePageOverlay(sponsorMenu, 700);
+                } else {
+                    placeDesktopAnchoredMenu(sponsorMenu, {
+                        maxHeight: '65vh',
+                        gap: '6px',
+                        upRight: deArrowWrap ? -(deArrowWrap.offsetWidth + 6) + 'px' : '0'
+                    });
+                }
+                sponsorMenu.style.display = 'block';
+                sponsorBtn.setAttribute('aria-expanded', 'true');
+            } else {
+                sponsorMenu.style.display = 'none';
+                sponsorBtn.setAttribute('aria-expanded', 'false');
+            }
+        });
+        sponsorMenu.addEventListener('click', function (e) { e.stopPropagation(); });
+        function onSponsorOutsideClick() {
+            sponsorMenu.style.display = 'none';
+            sponsorBtn.setAttribute('aria-expanded', 'false');
+        }
+        document.addEventListener('click', onSponsorOutsideClick);
+        registerCleanup(function () { document.removeEventListener('click', onSponsorOutsideClick); });
+        updateSponsorButton();
+        sponsorWrap.appendChild(sponsorBtn); sponsorWrap.appendChild(sponsorMenu); servicesRow.appendChild(sponsorWrap);
+
+        // DeArrow settings. The small panel keeps the high-value replacement
+        // controls but leaves DeArrow's submission and formatting workflows to
+        // the full extension.
+        var deArrowWrap = document.createElement('div');
+        deArrowWrap.style.cssText = 'position:relative';
+        var deArrowBtn = document.createElement('button');
+        deArrowBtn.className = 'wblock-tc-dearrow-button';
+        deArrowBtn.type = 'button';
+        deArrowBtn.style.cssText = btnStyle;
+        deArrowBtn.textContent = 'DA';
+        deArrowBtn.setAttribute('aria-haspopup', 'dialog');
+        deArrowBtn.setAttribute('aria-expanded', 'false');
+        var deArrowMenu = document.createElement('div');
+        deArrowMenu.className = 'wblock-tc-dearrow-menu';
+        deArrowMenu.setAttribute('role', 'dialog');
+        deArrowMenu.setAttribute('aria-label', deArrowLocale().title);
+        deArrowMenu.style.cssText = 'position:absolute;bottom:100%;right:0;margin-bottom:6px;box-sizing:border-box;' +
+            'width:' + (IS_IOS ? 'min(340px,calc(100vw - 16px))' : '310px') + ';max-height:65vh;overflow:auto;' +
+            'background:rgba(22,22,24,.98);border:1px solid rgba(255,255,255,.14);border-radius:10px;' +
+            'padding:12px;color:#fff;display:none;z-index:80;font:' + (IS_IOS ? '14px' : '12px') +
+            '/1.35 -apple-system,system-ui,sans-serif;box-shadow:0 8px 28px rgba(0,0,0,.45);text-align:left';
+
+        function updateDeArrowButton() {
+            var settings = loadDeArrowSettings();
+            var enabled = settings.enabled && !deArrowChannelExcluded(settings, sponsorBlockChannelId());
+            deArrowBtn.style.color = enabled ? '#ffb347' : '#aaa';
+            deArrowBtn.title = deArrowLocale().title;
+            deArrowBtn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+        }
+
+        function deArrowCheckboxRow(labelText, checked, disabled, settingName, onChange) {
+            var label = document.createElement('label');
+            label.style.cssText = 'display:flex;align-items:center;gap:8px;padding:7px 0;cursor:' +
+                (disabled ? 'default;opacity:.55' : 'pointer');
+            var input = document.createElement('input');
+            input.type = 'checkbox';
+            input.checked = checked;
+            input.disabled = disabled;
+            input.style.cssText = 'width:16px;height:16px;accent-color:#ffb347';
+            if (settingName) input.setAttribute('data-dearrow-setting', settingName);
+            input.addEventListener('change', function () { onChange(input.checked); });
+            var text = document.createElement('span');
+            text.textContent = labelText;
+            label.appendChild(input); label.appendChild(text);
+            return label;
+        }
+
+        function buildDeArrowMenu() {
+            while (deArrowMenu.firstChild) deArrowMenu.removeChild(deArrowMenu.firstChild);
+            var locale = deArrowLocale();
+            var settings = loadDeArrowSettings();
+            var heading = document.createElement('div');
+            heading.textContent = 'DeArrow';
+            heading.style.cssText = 'font-size:' + (IS_IOS ? '18px' : '15px') + ';font-weight:700;margin:0 0 7px';
+            deArrowMenu.appendChild(heading);
+            deArrowMenu.appendChild(deArrowCheckboxRow(locale.enabled, settings.enabled, false, 'enabled', function (checked) {
+                settings.enabled = checked;
+                saveDeArrowSettings(settings);
+                updateDeArrowButton();
+                buildDeArrowMenu();
+            }));
+            var divider = document.createElement('div');
+            divider.style.cssText = 'height:1px;background:rgba(255,255,255,.12);margin:5px 0';
+            deArrowMenu.appendChild(divider);
+            deArrowMenu.appendChild(deArrowCheckboxRow(locale.titles, settings.replaceTitles, !settings.enabled,
+                'replaceTitles', function (checked) {
+                    settings.replaceTitles = checked; saveDeArrowSettings(settings);
+                }));
+            deArrowMenu.appendChild(deArrowCheckboxRow(locale.thumbnails, settings.replaceThumbnails, !settings.enabled,
+                'replaceThumbnails', function (checked) {
+                    settings.replaceThumbnails = checked; saveDeArrowSettings(settings);
+                }));
+            deArrowMenu.appendChild(deArrowCheckboxRow(locale.random, settings.randomThumbnails,
+                !settings.enabled || !settings.replaceThumbnails, 'randomThumbnails', function (checked) {
+                    settings.randomThumbnails = checked; saveDeArrowSettings(settings);
+                }));
+            deArrowMenu.appendChild(deArrowCheckboxRow(locale.hover, settings.showOriginalOnHover, !settings.enabled,
+                'showOriginalOnHover', function (checked) {
+                    settings.showOriginalOnHover = checked; saveDeArrowSettings(settings);
+                }));
+            var channelId = sponsorBlockChannelId();
+            if (channelId) {
+                var channelRow = deArrowCheckboxRow(locale.channel,
+                    settings.excludedChannels.indexOf(channelId) !== -1, !settings.enabled, 'channel', function (checked) {
+                        var index = settings.excludedChannels.indexOf(channelId);
+                        if (checked && index === -1) settings.excludedChannels.push(channelId);
+                        if (!checked && index !== -1) settings.excludedChannels.splice(index, 1);
+                        saveDeArrowSettings(settings);
+                        updateDeArrowButton();
+                    });
+                channelRow.setAttribute('data-dearrow-channel', channelId);
+                deArrowMenu.appendChild(channelRow);
+            }
+            var footer = document.createElement('div');
+            footer.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-top:8px;padding-top:8px;' +
+                'border-top:1px solid rgba(255,255,255,.12)';
+            var reset = document.createElement('button');
+            reset.type = 'button'; reset.textContent = locale.reset;
+            reset.style.cssText = 'background:transparent;color:#aaa;border:0;padding:3px 0;font:inherit;cursor:pointer';
+            reset.addEventListener('click', function () {
+                deArrowSettingsCache = defaultDeArrowSettings();
+                saveDeArrowSettings(deArrowSettingsCache);
+                updateDeArrowButton();
+                buildDeArrowMenu();
+            });
+            var credit = document.createElement('a');
+            credit.href = 'https://dearrow.ajay.app/'; credit.target = '_blank'; credit.rel = 'noopener noreferrer';
+            credit.textContent = locale.using; credit.style.cssText = 'color:#69a9ff;text-decoration:none';
+            footer.appendChild(reset); footer.appendChild(credit); deArrowMenu.appendChild(footer);
+        }
+
+        deArrowBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            qualityMenu.style.display = 'none';
+            sponsorMenu.style.display = 'none';
+            sponsorBtn.setAttribute('aria-expanded', 'false');
+            if (deArrowMenu.style.display === 'none') {
+                buildDeArrowMenu();
+                if (IS_IOS) { showMobilePageOverlay(deArrowMenu, 520); }
+                else { placeDesktopAnchoredMenu(deArrowMenu, { maxHeight: '65vh', gap: '6px' }); }
+                deArrowMenu.style.display = 'block';
+                deArrowBtn.setAttribute('aria-expanded', 'true');
+            } else {
+                deArrowMenu.style.display = 'none';
+                deArrowBtn.setAttribute('aria-expanded', 'false');
+            }
+        });
+        deArrowMenu.addEventListener('click', function (e) { e.stopPropagation(); });
+        registerCleanup(function () {
+            removeMobilePageOverlay(qualityMenu);
+            removeMobilePageOverlay(sponsorMenu);
+            removeMobilePageOverlay(deArrowMenu);
+        });
+        function onDeArrowOutsideClick() {
+            deArrowMenu.style.display = 'none';
+            deArrowBtn.setAttribute('aria-expanded', 'false');
+        }
+        document.addEventListener('click', onDeArrowOutsideClick);
+        registerCleanup(function () { document.removeEventListener('click', onDeArrowOutsideClick); });
+        updateDeArrowButton();
+        deArrowWrap.appendChild(deArrowBtn); deArrowWrap.appendChild(deArrowMenu); servicesRow.appendChild(deArrowWrap);
+
+        // PiP button is intentionally omitted — Safari's native controls
+        // already provide PiP. Auto PiP handles automatic PiP entry.
 
         // Device-level "hide these controls" preference. While set, the
         // toolbar refuses to appear except while one of its own panels is
@@ -3142,6 +4458,7 @@
         }
 
         transformPlayer();
+        refreshDeArrowBranding();
         setTimeout(transformPlayer, 500);
     }
 
@@ -3267,6 +4584,17 @@
                     }
                 }
             }
+            // DeArrow follows YouTube's lazily inserted and recycled cards. Its
+            // scan is microtask-batched and does no work while the opt-in feature
+            // is disabled.
+            if (loadDeArrowSettings().enabled) {
+                for (var k = 0; k < records.length; k++) {
+                    scheduleDeArrowScan(records[k].target);
+                    for (var n = 0; n < records[k].addedNodes.length; n++) {
+                        if (records[k].addedNodes[n].nodeType === 1) scheduleDeArrowScan(records[k].addedNodes[n]);
+                    }
+                }
+            }
             // MutationObserver runs before rendering. Transform now—no polling
             // interval or debounce—so YouTube chrome never reaches next paint.
             if (relevant) { transformPlayer(); }
@@ -3290,6 +4618,7 @@
         watchNavigation();
         setupFullscreenHotkey();
         transformPlayer();
+        scheduleDeArrowScan(document);
 
         // Recovery scans only; normal startup is handled pre-paint above.
         if (document.readyState === 'loading') {
