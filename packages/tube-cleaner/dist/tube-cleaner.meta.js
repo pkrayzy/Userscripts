@@ -8,10 +8,10 @@
 // @description:fr  Ajoute à YouTube les commandes natives de Safari, les chapitres, les sous-titres, l’image dans l’image, la lecture en arrière-plan, le choix de qualité et le mode audio seul.
 // @description:it  Aggiunge a YouTube controlli nativi di Safari, capitoli, sottotitoli, picture-in-picture, riproduzione in background, selezione qualità e modalità solo audio.
 // @description:pt-BR  Adiciona ao YouTube controles nativos do Safari, capítulos, legendas, picture-in-picture, reprodução em segundo plano, seleção de qualidade e modo somente áudio.
-// @description:ja  YouTubeにSafariネイティブのコントロール、チャプター、字幕、ピクチャ・イン・ピクチャ、バックグラウンド再生、画質選択、音声のみモードを追加します。
+// @description:ja  YouTubeにSafariネイティブのコントロール、チャプター、字幕、ピクチャーインピクチャー、バックグラウンド再生、画質選択、音声のみモードを追加します。
 // @description:ko  YouTube에 Safari 네이티브 컨트롤, 챕터, 자막, PIP, 백그라운드 재생, 화질 선택 및 오디오 전용 모드를 추가합니다.
 // @description:ru  Добавляет YouTube нативные элементы управления Safari, главы, субтитры, картинку-в-картинке, фоновое воспроизведение, выбор качества и аудиорежим.
-// @description:zh-Hans  为 YouTube 添加 Safari 原生控件、章节、字幕、画中画, 后台播放, 画质选择和纯音频模式。
+// @description:zh-Hans  为 YouTube 添加 Safari 原生控件、章节、字幕、画中画、后台播放、画质选择和纯音频模式。
 // @author       wBlock
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*

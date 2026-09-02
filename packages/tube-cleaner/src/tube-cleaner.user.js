@@ -2,16 +2,16 @@
 // @name         Tube Cleaner
 // @namespace    com.skula.wblock
 // @version      0.1.16
-// @description  Gives YouTube Safari-native controls, chapters, subtitles, SponsorBlock, optional DeArrow branding, picture-in-picture, background playback, quality selection, and audio-only mode.
-// @description:de  Bietet YouTube native Safari-Steuerelemente, Kapitel, Untertitel, SponsorBlock, optionales DeArrow-Branding, Bild-in-Bild, Hintergrundwiedergabe, Qualitätsauswahl und einen Nur-Audio-Modus.
-// @description:es  Añade a YouTube controles nativos de Safari, capítulos, subtítulos, SponsorBlock, marcas opcionales de DeArrow, imagen en imagen, reproducción en segundo plano, selección de calidad y modo de solo audio.
-// @description:fr  Ajoute à YouTube les commandes natives de Safari, les chapitres, les sous-titres, SponsorBlock, le branding DeArrow facultatif, l’image dans l’image, la lecture en arrière-plan, le choix de qualité et le mode audio seul.
-// @description:it  Aggiunge a YouTube controlli nativi di Safari, capitoli, sottotitoli, SponsorBlock, branding DeArrow opzionale, picture-in-picture, riproduzione in background, selezione qualità e modalità solo audio.
-// @description:pt-BR  Adiciona ao YouTube controles nativos do Safari, capítulos, legendas, SponsorBlock, identidade visual opcional do DeArrow, picture-in-picture, reprodução em segundo plano, seleção de qualidade e modo somente áudio.
-// @description:ja  YouTubeにSafariネイティブのコントロール、チャプター、字幕、SponsorBlock、任意のDeArrow表示、ピクチャ・イン・ピクチャ、バックグラウンド再生、画質選択、音声のみモードを追加します。
-// @description:ko  YouTube에 Safari 네이티브 컨트롤, 챕터, 자막, SponsorBlock, 선택적 DeArrow 브랜딩, PIP, 백그라운드 재생, 화질 선택 및 오디오 전용 모드를 추가합니다.
-// @description:ru  Добавляет YouTube нативные элементы управления Safari, главы, субтитры, SponsorBlock, дополнительный брендинг DeArrow, картинку-в-картинке, фоновое воспроизведение, выбор качества и аудиорежим.
-// @description:zh-Hans  为 YouTube 添加 Safari 原生控件、章节、字幕、SponsorBlock、可选的 DeArrow 品牌替换、画中画、后台播放、画质选择和纯音频模式。
+// @description  Gives YouTube Safari-native controls, chapters, subtitles, picture-in-picture, background playback, quality selection, and audio-only mode.
+// @description:de  Bietet YouTube native Safari-Steuerelemente, Kapitel, Untertitel, Bild-in-Bild, Hintergrundwiedergabe, Qualitätsauswahl und einen Nur-Audio-Modus.
+// @description:es  Añade a YouTube controles nativos de Safari, capítulos, subtítulos, imagen en imagen, reproducción en segundo plano, selección de calidad y modo de solo audio.
+// @description:fr  Ajoute à YouTube les commandes natives de Safari, les chapitres, les sous-titres, l’image dans l’image, la lecture en arrière-plan, le choix de qualité et le mode audio seul.
+// @description:it  Aggiunge a YouTube controlli nativi di Safari, capitoli, sottotitoli, picture-in-picture, riproduzione in background, selezione qualità e modalità solo audio.
+// @description:pt-BR  Adiciona ao YouTube controles nativos do Safari, capítulos, legendas, picture-in-picture, reprodução em segundo plano, seleção de qualidade e modo somente áudio.
+// @description:ja  YouTubeにSafariネイティブのコントロール、チャプター、字幕、ピクチャーインピクチャー、バックグラウンド再生、画質選択、音声のみモードを追加します。
+// @description:ko  YouTube에 Safari 네이티브 컨트롤, 챕터, 자막, PIP, 백그라운드 재생, 화질 선택 및 오디오 전용 모드를 추가합니다.
+// @description:ru  Добавляет YouTube нативные элементы управления Safari, главы, субтитры, картинку-в-картинке, фоновое воспроизведение, выбор качества и аудиорежим.
+// @description:zh-Hans  为 YouTube 添加 Safari 原生控件、章节、字幕、画中画、后台播放、画质选择和纯音频模式。
 // @author       wBlock
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*
@@ -278,9 +278,7 @@
         try { localStorage.setItem(STORAGE_QUALITY, q); } catch (e) { /* ignore */ }
     }
 
-    // Device-level preference to keep the wBlock toolbar (quality / SB / DA)
-    // off the video entirely. Double-tap or double-click the video reveals it
-    // temporarily; the checkbox lives in the SponsorBlock settings panel.
+    // Device-level preference to keep the wBlock toolbar off the video entirely.
     function isToolbarHidden() {
         try { return localStorage.getItem(STORAGE_TOOLBAR_HIDDEN) === '1'; } catch (e) { return false; }
     }
@@ -1074,7 +1072,6 @@
         setupMediaSession(player, video);
         setupChapters(player, video);
         setupNativeSubtitles(player, video);
-        setupSponsorBlock(player, video);
     }
 
     var mediaSessionOwner = null;
@@ -1896,7 +1893,6 @@
     function saveDeArrowSettings(settings) {
         deArrowSettingsCache = settings;
         try { localStorage.setItem(DEARROW_SETTINGS_KEY, JSON.stringify(settings)); } catch (e) { /* ignore */ }
-        refreshDeArrowBranding();
     }
 
     function deArrowLocale() {
@@ -4011,7 +4007,6 @@
         document.addEventListener('click', onSponsorOutsideClick);
         registerCleanup(function () { document.removeEventListener('click', onSponsorOutsideClick); });
         updateSponsorButton();
-        sponsorWrap.appendChild(sponsorBtn); sponsorWrap.appendChild(sponsorMenu); servicesRow.appendChild(sponsorWrap);
 
         // DeArrow settings. The small panel keeps the high-value replacement
         // controls but leaves DeArrow's submission and formatting workflows to
@@ -4153,7 +4148,6 @@
         document.addEventListener('click', onDeArrowOutsideClick);
         registerCleanup(function () { document.removeEventListener('click', onDeArrowOutsideClick); });
         updateDeArrowButton();
-        deArrowWrap.appendChild(deArrowBtn); deArrowWrap.appendChild(deArrowMenu); servicesRow.appendChild(deArrowWrap);
 
         // PiP button is intentionally omitted — Safari's native controls
         // already provide PiP. Auto PiP handles automatic PiP entry.
@@ -4165,7 +4159,7 @@
         var toolbarUserHidden = isToolbarHidden();
         var toolbarRevealOverride = false;
         function anyToolbarPanelOpen() {
-            var panels = [qualityMenu, sponsorMenu, deArrowMenu];
+            var panels = [qualityMenu];
             return panels.some(function (p) {
                 return p && p.style.display !== 'none' && p.style.display !== '';
             });
@@ -4193,7 +4187,7 @@
             function hideToolbar() {
                 // Never hide while a settings panel is open — the controls
                 // that opened it must remain reachable to close it again.
-                var panels = [qualityMenu, sponsorMenu, deArrowMenu];
+                var panels = [qualityMenu];
                 var anyOpen = panels.some(function (p) {
                     return p && p.style.display !== 'none' && p.style.display !== '';
                 });
@@ -4291,7 +4285,7 @@
             var _isOverToolbar = false;
 
             function desktopPanelOpen() {
-                var panels = [qualityMenu, sponsorMenu, deArrowMenu];
+                var panels = [qualityMenu];
                 return panels.some(function (p) {
                     return p && p.style.display !== 'none' && p.style.display !== '';
                 });
@@ -4458,7 +4452,6 @@
         }
 
         transformPlayer();
-        refreshDeArrowBranding();
         setTimeout(transformPlayer, 500);
     }
 
@@ -4584,17 +4577,6 @@
                     }
                 }
             }
-            // DeArrow follows YouTube's lazily inserted and recycled cards. Its
-            // scan is microtask-batched and does no work while the opt-in feature
-            // is disabled.
-            if (loadDeArrowSettings().enabled) {
-                for (var k = 0; k < records.length; k++) {
-                    scheduleDeArrowScan(records[k].target);
-                    for (var n = 0; n < records[k].addedNodes.length; n++) {
-                        if (records[k].addedNodes[n].nodeType === 1) scheduleDeArrowScan(records[k].addedNodes[n]);
-                    }
-                }
-            }
             // MutationObserver runs before rendering. Transform now—no polling
             // interval or debounce—so YouTube chrome never reaches next paint.
             if (relevant) { transformPlayer(); }
@@ -4618,7 +4600,6 @@
         watchNavigation();
         setupFullscreenHotkey();
         transformPlayer();
-        scheduleDeArrowScan(document);
 
         // Recovery scans only; normal startup is handled pre-paint above.
         if (document.readyState === 'loading') {
@@ -4641,12 +4622,6 @@
             isToolbarHidden: isToolbarHidden,
             pipCaptionPumpTicks: function () { return pipCaptionPumpTicks; },
             setToolbarHidden: setToolbarHidden,
-            previewSponsorNotice: function () {
-                var p = findPlayer();
-                if (!p || !activeVideo) return 'no player';
-                showSponsorBlockNotice(p, activeVideo, { category: 'sponsor', segment: [0, 5], UUID: 'preview' }, {}, 'undo');
-                return 'ok';
-            },
             QUALITY_LABELS: QUALITY_LABELS,
             getPlayer: findPlayer,
             getChapters: extractChapters,
