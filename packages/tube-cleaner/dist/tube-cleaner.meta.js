@@ -22,6 +22,6 @@
 // @run-at       document-start
 // @inject-into  page
 // @grant        none
-// @downloadURL  https://raw.githubusercontent.com/pkrayzy/wBlock-userscripts/main/packages/tube-cleaner/dist/tube-cleaner.user.js
-// @updateURL    https://raw.githubusercontent.com/pkrayzy/wBlock-userscripts/main/packages/tube-cleaner/dist/tube-cleaner.meta.js
+// @downloadURL  https://raw.githubusercontent.com/pkrayzy/Userscripts/main/packages/tube-cleaner/dist/tube-cleaner.user.js
+// @updateURL    https://raw.githubusercontent.com/pkrayzy/Userscripts/main/packages/tube-cleaner/dist/tube-cleaner.meta.js
 // ==/UserScript==
