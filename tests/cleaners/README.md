@@ -30,11 +30,15 @@ mirroring (including token-gated caption metadata fallback and routing Safari’
 caption selection to YouTube’s styled renderer), and k-anonymous SponsorBlock
 skipping with a bounded session cache, precise boundary timers, persistent
 category modes, manual skip, and Undo behavior. The desktop fixture also enables
-the otherwise opt-in DeArrow integration and verifies submitted watch/card titles,
-cached thumbnails, the opt-in random-frame fallback for videos without a submitted
+the otherwise opt-in DeArrow integration (configured by the wBlock app through an injected constant) and verifies submitted watch/card titles,
+fetched thumbnails (re-requested once at the server's `X-Timestamp` when it differs from the branding time), the opt-in random-frame fallback for videos without a submitted
 thumbnail, separate title/thumbnail settings, original-on-hover restoration,
-current-channel exclusions, bounded request reuse across SPA activation, and the
-dedicated SB/DA service row.
+bounded request reuse across SPA activation, and the SB service row with no
+DeArrow pill on the player, stacked above the quality row. The iPhone run also
+fills the origin with resume positions, makes the first write of the
+hide-controls preference throw QuotaExceededError, and expects the preference
+to persist after the oldest positions are pruned and the toolbar to start
+hidden on reload.
 `fixture-tube-cleaner-multiple.html` models retained
 Shorts players and verifies native enhancements follow the visible playing
 video, with the toolbar kept off the subscribe row and action rail. `fixture-tube-cleaner-early.html` creates the YouTube player from a
@@ -100,9 +104,22 @@ Player Cleaner scenarios:
   IntersectionObservers. Every active count must remain flat.
 - Visibility scenarios shadow the page-facing document state while simulating a
   native hidden tab, proving both cleaners still enter PiP from the captured
-  browser getter but not merely from window focus loss. The Tube Cleaner fixture
-  also verifies its quality path keeps YouTube's settings shell hidden, selects
-  the requested option once, and closes it without an extra toggle.
+  browser getter while desktop window focus alone does nothing. The iPhone Tube
+  Cleaner scenario enters PiP on blur before WebKit can suspend playback and
+  supplies the video title Safari uses in native media UI. The fixture also
+  verifies its quality path keeps YouTube's settings shell hidden, selects
+  the requested option once, and closes it without an extra toggle. The YouTube
+  Music scenario keeps YTM's responsive player and Media Session untouched while
+  retaining Tube Cleaner's background-playback guard. A second YouTube Music
+  scenario mirrors the live player API (`getPresentingPlayerType()` 2 with the
+  `ad-showing` class during an ad, `ytcfg` `AUDIO_QUALITY`, the
+  `MUSIC_WEB_AUDIO_QUALITY` settings listbox) and checks that an ad ends through
+  its own media with content never sought, a stored audio quality is restored
+  and a stock menu pick remembered, Now Playing is published only when the site
+  has not with album and artwork, video mode enters WebKit PiP on a real hidden
+  transition, lock-screen handlers keep stock meaning after site-owned metadata,
+  a playing song resumes after YTM pauses it for a slider drag while an already
+  paused song stays paused, and a replaced player is rebound.
 
 ```sh
 node tests/cleaners/run-tests.mjs            # exit code 1 if any check fails

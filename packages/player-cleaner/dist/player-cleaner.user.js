@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Player Cleaner
 // @namespace    com.skula.wblock
-// @version      0.1.30
+// @version      0.1.33
 // @description  Gives custom web players native controls, auto PiP, background playback, restored subtitle and chapter tracks, Now Playing metadata, and remembered playback preferences.
 // @description:de  Bietet Web-Playern native Steuerelemente, Auto-PiP, Hintergrundwiedergabe, wiederhergestellte Untertitel und Kapitel, Now-Playing-Metadaten und gespeicherte Wiedergabeeinstellungen.
 // @description:es  Añade a los reproductores web controles nativos, PiP automático, reproducción en segundo plano, subtítulos y capítulos restaurados, metadatos Now Playing y preferencias recordadas.
@@ -302,6 +302,7 @@
     var PLAYER_SELECTORS = [
         '.video-js',                 // video.js
         '.vjs-tech',                 // video.js (inner tech, handled via parent)
+        '.theoplayer-container',     // THEOplayer (also carries .video-js)
         '.jwplayer',                 // JW Player
         '.jw-wrapper',               // JW Player
         '.plyr',                     // Plyr
@@ -330,6 +331,9 @@
         '#player-videojs'            // PBS portal / station / partner player
     ];
     var PLAYER_SELECTOR = PLAYER_SELECTORS.join(',');
+    // Wrappers whose framework keeps driving the DOM after startup; nativeize
+    // the media element inside them but never empty the shell.
+    var SHELL_PRESERVE_SELECTOR = '.mejs-container,.mejs__container,.theoplayer-container';
 
     function isHttpUrl(value) {
         return typeof value === 'string' && /^https?:\/\//i.test(value);
@@ -1069,6 +1073,20 @@
             if (video.hasAttribute('disabled')) { video.removeAttribute('disabled'); }
             if (video.disabled) { video.disabled = false; }
         } catch (e) { /* ignore */ }
+        restoreVideoHitTesting(video);
+    }
+
+    // THEOplayer (Olympics, FIFA) pins pointer-events:none on the media element
+    // so its own overlay owns every hit. With native controls forced on, that
+    // rule leaves Safari painting a control bar nothing can click; hits land
+    // on the .vjs-tech wrapper instead. Re-enable hit testing on the video
+    // itself with an inline !important so a site stylesheet cannot win back.
+    function restoreVideoHitTesting(video) {
+        if (!video || !video.style) { return; }
+        try {
+            if (getComputedStyle(video).pointerEvents !== 'none') { return; }
+            video.style.setProperty('pointer-events', 'auto', 'important');
+        } catch (e) { /* ignore */ }
     }
 
     function isFacebookPage() {
@@ -1166,11 +1184,13 @@
     // Stopping propagation in bubble phase lets native play/pause/skip run first
     // while keeping outer shells (video.js, Vimeo, Reddit) from seeing the same
     // tap and toggling playback again. iOS Reddit listens for touch/pointer on
-    // shreddit-player, so click-only was not enough.
+    // shreddit-player, so click-only was not enough. THEOplayer (Olympics,
+    // FIFA) toggles playback from mousedown on its shell, which a native
+    // control tap still emits, so the mouse pair has to stop here too.
     function blockCompetingClicks(video) {
         if (!video || video._wblockClickGuard) return;
         function stopBubble(e) { e.stopPropagation(); }
-        var types = ['click', 'pointerdown', 'pointerup', 'touchstart', 'touchend'];
+        var types = ['click', 'pointerdown', 'pointerup', 'mousedown', 'mouseup', 'touchstart', 'touchend'];
         try {
             for (var i = 0; i < types.length; i++) {
                 video.addEventListener(types[i], stopBubble);
@@ -1206,12 +1226,13 @@
                 video.setAttribute('controls', '');
             }
             applyRemotePlaybackPolicy(video);
+            restoreVideoHitTesting(video);
         }
 
         var observer = null;
         try {
             observer = new MutationObserver(restore);
-            observer.observe(video, { attributes: true, attributeFilter: ['controls', 'disableremoteplayback', 'x-webkit-airplay'] });
+            observer.observe(video, { attributes: true, attributeFilter: ['controls', 'disableremoteplayback', 'x-webkit-airplay', 'style'] });
         } catch (e) { /* ignore */ }
 
         restore();
@@ -2611,9 +2632,11 @@
             if (container.getRootNode && container.getRootNode() !== document) { return; }
             // MediaElement keeps querying its generated wrapper after startup;
             // deleting that wrapper leaves playback alive but makes its own
-            // lifecycle callbacks throw. Its controls are already hidden, so
-            // preserve the shell and nativeize the media element in place.
-            if (container.matches && container.matches('.mejs-container,.mejs__container')) { return; }
+            // lifecycle callbacks throw. THEOplayer (FIFA, Olympics) reuses the
+            // video.js class on a shell that owns its DRM and ad pipeline, and
+            // stops playback when that shell is emptied. Their controls are
+            // already hidden, so preserve the shell and nativeize in place.
+            if (container.matches && container.matches(SHELL_PRESERVE_SELECTOR)) { return; }
         } catch (e) { /* continue with the conservative light-DOM path */ }
 
         // During parser construction, never delete the wrapper DOM before the

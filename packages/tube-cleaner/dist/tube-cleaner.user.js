@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tube Cleaner
 // @namespace    com.skula.wblock
-// @version      0.1.16
+// @version      0.1.27
 // @description  Gives YouTube Safari-native controls, chapters, subtitles, picture-in-picture, background playback, quality selection, and audio-only mode.
 // @description:de  Bietet YouTube native Safari-Steuerelemente, Kapitel, Untertitel, Bild-in-Bild, Hintergrundwiedergabe, Qualitätsauswahl und einen Nur-Audio-Modus.
 // @description:es  Añade a YouTube controles nativos de Safari, capítulos, subtítulos, imagen en imagen, reproducción en segundo plano, selección de calidad y modo de solo audio.
@@ -91,6 +91,8 @@
     // documentElement here: production injection can run before <html> exists.
     var IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
         (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    var IS_IPHONE = /iPhone|iPod/.test(navigator.userAgent);
+    var IS_YOUTUBE_MUSIC = location.hostname === 'music.youtube.com';
     // ------------------------------------------------------------------
     // Auto PiP
     // ------------------------------------------------------------------
@@ -107,7 +109,7 @@
     }
 
     function setAutoPiP(v) {
-        try { localStorage.setItem(AUTO_PIP_KEY, v ? '1' : '0'); } catch (e) { /* ignore */ }
+        storageSet(AUTO_PIP_KEY, v ? '1' : '0');
         autoPiPEnabled = v;
     }
 
@@ -187,29 +189,71 @@
     }
 
     function setAudioOnly(v) {
-        try { localStorage.setItem(STORAGE_AUDIO, v ? '1' : '0'); } catch (e) { /* ignore */ }
+        storageSet(STORAGE_AUDIO, v ? '1' : '0');
     }
 
     function getPreferredQuality() {
         try { return localStorage.getItem(STORAGE_QUALITY) || 'auto'; } catch (e) { return 'auto'; }
     }
 
-    function setPreferredQuality(q) {
-        try { localStorage.setItem(STORAGE_QUALITY, q); } catch (e) { /* ignore */ }
+    // Safari's per-origin storage quota is shared with everything YouTube and
+    // the wBlock warm-start cache keep on youtube.com. When it is full,
+    // setItem throws and a silently swallowed write looks like a preference
+    // that "did not save". Tube Cleaner's own resume positions are the only
+    // thing it can make room with, so a failed write prunes the oldest of
+    // them and tries once more.
+    var POSITION_KEEP_ON_PRUNE = 40;
+
+    function prunePlaybackPositions(keep) {
+        var entries = [];
+        try {
+            for (var i = 0; i < localStorage.length; i++) {
+                var key = localStorage.key(i);
+                if (!key || key.indexOf(STORAGE_POSITION) !== 0) continue;
+                var updatedAt = 0;
+                try { updatedAt = Number(JSON.parse(localStorage.getItem(key) || 'null').updatedAt) || 0; } catch (e) { /* stale */ }
+                entries.push({ key: key, updatedAt: updatedAt });
+            }
+        } catch (e) { return 0; }
+        if (entries.length <= keep) return 0;
+        entries.sort(function (a, b) { return b.updatedAt - a.updatedAt; });
+        var removed = 0;
+        for (var j = keep; j < entries.length; j++) {
+            try { localStorage.removeItem(entries[j].key); removed++; } catch (e) { /* ignore */ }
+        }
+        return removed;
     }
 
-    // Device-level preference to keep the wBlock toolbar (quality / SB / DA)
+    function storageSet(key, value) {
+        try { localStorage.setItem(key, value); return true; } catch (e) { /* quota or disabled */ }
+        if (!prunePlaybackPositions(POSITION_KEEP_ON_PRUNE)) return false;
+        try { localStorage.setItem(key, value); return true; } catch (e) { return false; }
+    }
+
+    function storageRemove(key) {
+        try { localStorage.removeItem(key); } catch (e) { /* ignore */ }
+    }
+
+    function setPreferredQuality(q) {
+        storageSet(STORAGE_QUALITY, q);
+    }
+
+    // Device-level preference to keep the wBlock toolbar (quality / SB)
     // off the video entirely. Double-tap or double-click the video reveals it
     // temporarily; the checkbox lives in the SponsorBlock settings panel.
+    // The in-memory mirror keeps the choice honoured for this page even when
+    // the origin's storage refuses the write.
+    var toolbarHiddenMirror = null;
+
     function isToolbarHidden() {
+        if (toolbarHiddenMirror !== null) return toolbarHiddenMirror;
         try { return localStorage.getItem(STORAGE_TOOLBAR_HIDDEN) === '1'; } catch (e) { return false; }
     }
 
     function setToolbarHidden(hidden) {
-        try {
-            if (hidden) { localStorage.setItem(STORAGE_TOOLBAR_HIDDEN, '1'); }
-            else { localStorage.removeItem(STORAGE_TOOLBAR_HIDDEN); }
-        } catch (e) { /* ignore */ }
+        toolbarHiddenMirror = !!hidden;
+        if (hidden) storageSet(STORAGE_TOOLBAR_HIDDEN, '1');
+        else storageRemove(STORAGE_TOOLBAR_HIDDEN);
         document.dispatchEvent(new CustomEvent('wblock-tc-toolbar-pref'));
     }
 
@@ -245,6 +289,11 @@
         '#movie_player .ytp-remote-button,',
         '#movie_player .ytp-size-button,',
         '#movie_player .ytp-subtitles-button,',
+        // YouTube's DOM caption overlay. Safari renders the installed VTT
+        // tracks itself, so this would only double the text once YouTube's
+        // C shortcut or its remembered caption preference turns it on.
+        '#movie_player .ytp-caption-window-container,',
+        '#movie_player .caption-window,',
         '#movie_player .ytp-autonav-endscreen-button,',
         '#movie_player .ytp-share-button,',
         '#movie_player .ytp-watch-later-button,',
@@ -350,6 +399,13 @@
         '.wblock-tc-native .wblock-tc-sponsor-notice,',
         '.wblock-tc-native .wblock-tc-sponsor-notice *',
         '{ pointer-events: auto !important; }',
+        // A faded-out toolbar must not swallow taps. pointer-events does not
+        // cascade, so the buttons need their own rule while it is hidden.
+        '.wblock-tc-toolbar.wblock-tc-toolbar-hidden,',
+        '.wblock-tc-toolbar.wblock-tc-toolbar-hidden *,',
+        '.wblock-tc-native .wblock-tc-toolbar.wblock-tc-toolbar-hidden,',
+        '.wblock-tc-native .wblock-tc-toolbar.wblock-tc-toolbar-hidden *',
+        '{ pointer-events: none !important; }',
 
         // Mobile YouTube renders its new controls outside #movie_player in a
         // sibling custom-element tree. It appears after "Tap to unmute" and
@@ -478,7 +534,7 @@
         if (!root) { return false; }
         var style = document.createElement('style');
         style.id = STYLE_ID;
-        style.textContent = CSS;
+        style.textContent = IS_YOUTUBE_MUSIC ? '' : CSS;
         root.appendChild(style);
         // Shorts pages keep YouTube's stock UI; transformPlayer() re-enables
         // the sheet when the SPA returns to a regular page.
@@ -503,8 +559,12 @@
     // Background playback
     // ------------------------------------------------------------------
 
-    // Track real visibility state separately since we override document.hidden.
+    // Track real visibility state separately since we override the values that
+    // YouTube reads. The capture listener runs before the site's listeners,
+    // notifies Tube Cleaner's own observers, and keeps the hidden transition
+    // from reaching YouTube's background-pause handler.
     var _realHidden = false;
+    var realVisibilityObservers = [];
 
     function findDocumentGetter(name) {
         try {
@@ -528,10 +588,29 @@
         } catch (e) { /* ignore */ }
     }
 
-    // Capture initially and keep using the native prototype getters after the
+    function observeRealVisibility(callback) {
+        realVisibilityObservers.push(callback);
+        return function () {
+            var index = realVisibilityObservers.indexOf(callback);
+            if (index !== -1) realVisibilityObservers.splice(index, 1);
+        };
+    }
+
+    function onRealVisibilityChange(event) {
+        updateRealVisibility();
+        var observers = realVisibilityObservers.slice();
+        for (var i = 0; i < observers.length; i++) {
+            try { observers[i](); } catch (e) { /* ignore */ }
+        }
+        if (_realHidden && event && typeof event.stopImmediatePropagation === 'function') {
+            event.stopImmediatePropagation();
+        }
+    }
+
+    // Capture initially and keep using the native prototype getter after the
     // document instance properties are shadowed for background playback.
     updateRealVisibility();
-    document.addEventListener('visibilitychange', updateRealVisibility);
+    document.addEventListener('visibilitychange', onRealVisibilityChange, true);
 
     function enableBackgroundPlayback() {
         try {
@@ -546,6 +625,430 @@
                 configurable: true
             });
         } catch (e) { /* ignore */ }
+        try {
+            Object.defineProperty(document, 'webkitHidden', {
+                get: function () { return false; },
+                configurable: true
+            });
+        } catch (e) { /* ignore */ }
+        try {
+            Object.defineProperty(document, 'webkitVisibilityState', {
+                get: function () { return 'visible'; },
+                configurable: true
+            });
+        } catch (e) { /* ignore */ }
+    }
+
+    // ------------------------------------------------------------------
+    // YouTube Music
+    //
+    // music.youtube.com ships a complete responsive player with its own
+    // transport, settings page, and Media Session module, so Tube Cleaner never
+    // nativeizes its <video>, adds controls, or draws a toolbar there. The
+    // integration below owns only what the stock site leaves broken in Safari:
+    //
+    // - The document-start visibility shadow above. Song mode plays an
+    //   audio-only MSE source (no video track), which WebKit lets continue under
+    //   lock as long as page script does not pause it; the shadow keeps YTM's
+    //   own background check reading "visible".
+    // - The Audio quality choice. YTM's Playback settings menu (client id
+    //   MUSIC_WEB_AUDIO_QUALITY, values '2' Normal and '1' Low) applies a pick by
+    //   writing ytcfg AUDIO_QUALITY, which selects the audio itag on the next
+    //   track load. Sessions the server does not remember lose it on reload, so
+    //   the last pick is stored locally and written back before playback.
+    // - Ad breaks. While the ad player presents (getPresentingPlayerType() 2
+    //   with the ad-showing class) the <video> carries the ad media; seeking
+    //   that media to its own end finishes the ad through the player's normal
+    //   ended path and content resumes at 0. The content element is never sought.
+    // - Now Playing. YTM publishes Media Session metadata itself; when it has
+    //   not (fresh load, replaced player), the current track is published from
+    //   the player API with the player bar as fallback, and handlers keep their
+    //   stock meaning by driving the player API.
+    // ------------------------------------------------------------------
+
+    var MUSIC_AUDIO_QUALITY_KEY = 'wblock.tubeCleaner.musicAudioQuality';
+    var MUSIC_AUDIO_QUALITY_VALUES = { '1': 'AUDIO_QUALITY_LOW', '2': 'AUDIO_QUALITY_MEDIUM' };
+    var MUSIC_AD_PLAYER_TYPE = 2;
+    var musicState = { video: null, player: null, unbind: null, adEnds: 0, lastAdEnd: 0, published: null, publishedId: '', owns: false };
+
+    function musicYtcfg() {
+        var cfg = window.ytcfg;
+        return cfg && typeof cfg.get === 'function' && typeof cfg.set === 'function' ? cfg : null;
+    }
+
+    function getMusicAudioQuality() {
+        try {
+            var stored = localStorage.getItem(MUSIC_AUDIO_QUALITY_KEY);
+            return /^AUDIO_QUALITY_[A-Z]+$/.test(stored || '') ? stored : null;
+        } catch (e) { return null; }
+    }
+
+    function setMusicAudioQuality(value) {
+        try {
+            if (value) localStorage.setItem(MUSIC_AUDIO_QUALITY_KEY, value);
+            else localStorage.removeItem(MUSIC_AUDIO_QUALITY_KEY);
+        } catch (e) { /* ignore */ }
+    }
+
+    function applyMusicAudioQuality() {
+        var cfg = musicYtcfg();
+        var preferred = getMusicAudioQuality();
+        if (!cfg || !preferred) return false;
+        try {
+            if (cfg.get('AUDIO_QUALITY') === preferred) return false;
+            cfg.set('AUDIO_QUALITY', preferred);
+            log('YouTube Music audio quality restored:', preferred);
+            return true;
+        } catch (e) { return false; }
+    }
+
+    function musicAudioQualityMenu(node) {
+        var el = null;
+        try { el = node && node.nodeType === 1 ? node.closest('ytmusic-setting-single-option-menu-renderer') : null; } catch (e) { return null; }
+        return el && el.data && el.data.itemId === 'MUSIC_WEB_AUDIO_QUALITY' ? el : null;
+    }
+
+    function rememberMusicAudioQuality(menu) {
+        try {
+            var items = menu.data && menu.data.items || [];
+            var item = items[menu.selected] && items[menu.selected].settingMenuItemRenderer;
+            var value = item && MUSIC_AUDIO_QUALITY_VALUES[String(item.value)];
+            if (!value) return;
+            setMusicAudioQuality(value);
+            var cfg = musicYtcfg();
+            if (cfg && cfg.get('AUDIO_QUALITY') !== value) cfg.set('AUDIO_QUALITY', value);
+        } catch (e) { /* ignore */ }
+    }
+
+    function onMusicSettingsClick(event) {
+        var menu = musicAudioQualityMenu(event.target);
+        if (!menu) return;
+        // The listbox updates `selected` after this capture listener; read it
+        // once the click has settled and once more after the endpoint round trip.
+        setTimeout(function () { rememberMusicAudioQuality(menu); }, 0);
+        setTimeout(function () { rememberMusicAudioQuality(menu); }, 600);
+    }
+
+    function musicPlayer() {
+        return document.getElementById('movie_player');
+    }
+
+    function musicAdShowing(player) {
+        try {
+            return !!player && player.classList.contains('ad-showing') &&
+                typeof player.getPresentingPlayerType === 'function' &&
+                player.getPresentingPlayerType() === MUSIC_AD_PLAYER_TYPE;
+        } catch (e) { return false; }
+    }
+
+    function endMusicAd(player, video) {
+        // A paused ad (preroll waiting for the first tap) does not reach its
+        // ended path from a seek; the playing listener retries once it runs.
+        if (!video || video.paused || !musicAdShowing(player)) return false;
+        var duration = Number(video.duration);
+        if (!isFinite(duration) || duration <= 0) return false;
+        // Wait for the ad media to actually progress: ending it during its own
+        // load left the ad player stuck at the end in a pod of two.
+        if (!(video.currentTime > 0.5)) return false;
+        if (video.currentTime >= duration - 0.25) return false;
+        var now = Date.now();
+        if (now - musicState.lastAdEnd < 1000) return false;
+        musicState.lastAdEnd = now;
+        try { video.currentTime = duration; } catch (e) { return false; }
+        musicState.adEnds++;
+        log('YouTube Music ad ended');
+        return true;
+    }
+
+    function musicTextOf(node) {
+        if (!node) return '';
+        if (typeof node === 'string') return node;
+        if (node.simpleText) return String(node.simpleText);
+        if (node.runs && node.runs.length) return node.runs.map(function (run) { return run.text || ''; }).join('');
+        return '';
+    }
+
+    function musicTrackData(player) {
+        var data = {}, details = {}, album = '';
+        try { data = player.getVideoData() || {}; } catch (e) { /* ignore */ }
+        try {
+            var response = typeof player.getPlayerResponse === 'function' ? player.getPlayerResponse() : null;
+            details = response && response.videoDetails || {};
+        } catch (e) { /* ignore */ }
+        try {
+            var next = typeof data.getWatchNextResponse === 'function' ? data.getWatchNextResponse() : null;
+            var overlay = next && next.playerOverlays && next.playerOverlays.playerOverlayRenderer;
+            var mediaSession = overlay && overlay.browserMediaSession && overlay.browserMediaSession.browserMediaSessionRenderer;
+            album = musicTextOf(mediaSession && mediaSession.album);
+        } catch (e) { /* ignore */ }
+        var bar = document.querySelector('ytmusic-player-bar');
+        var barTitle = bar && bar.querySelector('.title');
+        var barByline = bar && bar.querySelector('.byline');
+        if (!album && barByline) {
+            var albumLink = barByline.querySelector('a[href^="browse/"], a[href^="/browse/"]');
+            album = albumLink ? albumLink.textContent.trim() : '';
+        }
+        var artistLink = barByline && barByline.querySelector('a[href^="channel/"], a[href^="/channel/"]');
+        var thumbnails = details.thumbnail && details.thumbnail.thumbnails || [];
+        if (!thumbnails.length && bar) {
+            var image = bar.querySelector('img.image');
+            if (image && image.src) thumbnails = [{ url: image.src, width: 60, height: 60 }];
+        }
+        return {
+            id: data.video_id || details.videoId || '',
+            title: String(data.title || details.title || (barTitle && barTitle.textContent.trim()) || ''),
+            artist: String(data.author || details.author || (artistLink && artistLink.textContent.trim()) || ''),
+            album: String(album || ''),
+            artwork: thumbnails.filter(function (thumb) { return thumb && thumb.url; }).map(function (thumb) {
+                var art = { src: String(thumb.url) };
+                if (thumb.width && thumb.height) art.sizes = thumb.width + 'x' + thumb.height;
+                return art;
+            })
+        };
+    }
+
+    function setupYouTubeMusic() {
+        document.addEventListener('click', onMusicSettingsClick, true);
+        applyMusicAudioQuality();
+        document.addEventListener('yt-navigate-finish', applyMusicAudioQuality, true);
+        // ytcfg is defined by an inline head script; apply again once it exists.
+        if (!musicYtcfg()) {
+            document.addEventListener('DOMContentLoaded', applyMusicAudioQuality, { once: true });
+        }
+
+        observeMusicPlayer();
+    }
+
+    var musicPlayerObserver = null;
+    var musicClassObserver = null;
+
+    function observeMusicPlayer() {
+        if (typeof MutationObserver === 'undefined') { bindMusicPlayer(); return; }
+        musicPlayerObserver = new MutationObserver(function () { bindMusicPlayer(); });
+        var start = function () {
+            try { musicPlayerObserver.observe(document.documentElement || document, { childList: true, subtree: true }); } catch (e) { /* ignore */ }
+            bindMusicPlayer();
+        };
+        if (document.documentElement) start();
+        else document.addEventListener('DOMContentLoaded', start, { once: true });
+    }
+
+    // YTM keeps one persistent <video>; rebind only when the player or its
+    // element is actually replaced so listeners never stack.
+    function bindMusicPlayer() {
+        var player = musicPlayer();
+        var video = player && player.querySelector('video');
+        if (!player || !video) return;
+        if (musicState.player === player && musicState.video === video) return;
+        unbindMusicPlayer();
+        musicState.player = player;
+        musicState.video = video;
+
+        var hadVideoTitle = video.hasAttribute('title');
+        var originalVideoTitle = video.getAttribute('title');
+        var seekGesture = false, seekWasPlaying = false, seekResumeTimer = null;
+        function isSeekControl(target) {
+            try { return !!(target && target.closest && target.closest('tp-yt-paper-slider#progress-bar')); }
+            catch (e) { return false; }
+        }
+        function onSeekStart(event) {
+            if (seekGesture || !isSeekControl(event.target)) return;
+            seekGesture = true;
+            // YTM pauses while dragging its song-mode slider. Remember the state
+            // before its target listener runs so a playing song remains playing.
+            seekWasPlaying = !video.paused && !video.ended;
+        }
+        function onSeekEnd() {
+            if (!seekGesture) return;
+            seekGesture = false;
+            if (seekResumeTimer !== null) clearTimeout(seekResumeTimer);
+            seekResumeTimer = setTimeout(function () {
+                seekResumeTimer = null;
+                if (seekWasPlaying && musicState.player === player && video.paused && !video.ended && !musicAdShowing(player)) {
+                    try { if (typeof player.playVideo === 'function') player.playVideo(); else video.play(); } catch (e) { /* ignore */ }
+                }
+                seekWasPlaying = false;
+            }, 100);
+        }
+        function onSeekCancel() { seekGesture = false; seekWasPlaying = false; }
+        function onAdSignal() { endMusicAd(player, video); }
+        function onTrackSignal() { syncMusicNowPlaying(player, video); }
+        function onTimeUpdate() { endMusicAd(player, video); scheduleMusicPosition(player, video); }
+        function onNavigate() { syncMusicNowPlaying(player, video); }
+        function onVisibility() {
+            // iOS suspends a real video track under lock. PiP is WebKit's public
+            // background-video session and keeps that track alive; audio-only
+            // song mode has no PiP support and continues through the shadowed
+            // visibility state as before.
+            if (_realHidden) enterPiP(video);
+            else if (document.hasFocus() && isPiPActive(video)) exitPiP(video);
+        }
+        function onFocus() {
+            if (!_realHidden && isPiPActive(video)) exitPiP(video);
+        }
+        function onBlur() {
+            if (IS_IPHONE && !video.paused && !video.ended) enterPiP(video);
+        }
+
+        video.addEventListener('loadedmetadata', onAdSignal);
+        video.addEventListener('durationchange', onAdSignal);
+        video.addEventListener('playing', onAdSignal);
+        video.addEventListener('timeupdate', onTimeUpdate);
+        video.addEventListener('loadedmetadata', onTrackSignal);
+        video.addEventListener('durationchange', onTrackSignal);
+        video.addEventListener('play', onTrackSignal);
+        video.addEventListener('pause', onTrackSignal);
+        video.addEventListener('ended', onTrackSignal);
+        document.addEventListener('yt-navigate-finish', onNavigate, true);
+        document.addEventListener('pointerdown', onSeekStart, true);
+        document.addEventListener('touchstart', onSeekStart, true);
+        document.addEventListener('pointerup', onSeekEnd, true);
+        document.addEventListener('touchend', onSeekEnd, true);
+        document.addEventListener('pointercancel', onSeekCancel, true);
+        document.addEventListener('touchcancel', onSeekCancel, true);
+        var removeVisibilityObserver = observeRealVisibility(onVisibility);
+        window.addEventListener('focus', onFocus);
+        window.addEventListener('blur', onBlur);
+
+        if (typeof MutationObserver !== 'undefined') {
+            musicClassObserver = new MutationObserver(function () {
+                endMusicAd(player, video);
+                syncMusicNowPlaying(player, video);
+            });
+            try { musicClassObserver.observe(player, { attributes: true, attributeFilter: ['class'] }); } catch (e) { /* ignore */ }
+        }
+
+        musicState.unbind = function () {
+            video.removeEventListener('loadedmetadata', onAdSignal);
+            video.removeEventListener('durationchange', onAdSignal);
+            video.removeEventListener('playing', onAdSignal);
+            video.removeEventListener('timeupdate', onTimeUpdate);
+            video.removeEventListener('loadedmetadata', onTrackSignal);
+            video.removeEventListener('durationchange', onTrackSignal);
+            video.removeEventListener('play', onTrackSignal);
+            video.removeEventListener('pause', onTrackSignal);
+            video.removeEventListener('ended', onTrackSignal);
+            document.removeEventListener('yt-navigate-finish', onNavigate, true);
+            document.removeEventListener('pointerdown', onSeekStart, true);
+            document.removeEventListener('touchstart', onSeekStart, true);
+            document.removeEventListener('pointerup', onSeekEnd, true);
+            document.removeEventListener('touchend', onSeekEnd, true);
+            document.removeEventListener('pointercancel', onSeekCancel, true);
+            document.removeEventListener('touchcancel', onSeekCancel, true);
+            removeVisibilityObserver();
+            window.removeEventListener('focus', onFocus);
+            window.removeEventListener('blur', onBlur);
+            if (hadVideoTitle) video.setAttribute('title', originalVideoTitle || '');
+            else video.removeAttribute('title');
+            if (seekResumeTimer !== null) clearTimeout(seekResumeTimer);
+        };
+
+        endMusicAd(player, video);
+        syncMusicNowPlaying(player, video);
+    }
+
+    function unbindMusicPlayer() {
+        if (musicState.unbind) { try { musicState.unbind(); } catch (e) { /* ignore */ } }
+        musicState.unbind = null;
+        if (musicClassObserver) { try { musicClassObserver.disconnect(); } catch (e) { /* ignore */ } }
+        musicClassObserver = null;
+        if (musicPositionTimer !== null) { clearTimeout(musicPositionTimer); musicPositionTimer = null; }
+        musicState.player = null;
+        musicState.video = null;
+        musicState.owns = false;
+        musicState.published = null;
+    }
+
+    var musicPositionTimer = null;
+
+    function scheduleMusicPosition(player, video) {
+        if (!musicState.owns || musicPositionTimer !== null) return;
+        musicPositionTimer = setTimeout(function () {
+            musicPositionTimer = null;
+            publishMusicPosition(player, video);
+        }, 500);
+    }
+
+    function publishMusicPosition(player, video) {
+        var session = navigator.mediaSession;
+        if (!musicState.owns || !session || typeof session.setPositionState !== 'function') return;
+        var duration = Number(video.duration), position = Number(video.currentTime), rate = Number(video.playbackRate) || 1;
+        if (!isFinite(duration) || duration <= 0 || !isFinite(position) || position < 0 || rate <= 0) return;
+        try { session.setPositionState({ duration: duration, playbackRate: rate, position: Math.min(position, duration) }); }
+        catch (e) { /* transient media state */ }
+    }
+
+    // Publish Now Playing only when YTM has not. Its own module sets metadata
+    // on videodatachange; a matching title means it is in charge and nothing
+    // here touches the session. Ad metadata is YTM's as well.
+    function syncMusicNowPlaying(player, video) {
+        var session = navigator.mediaSession;
+        if (!session || typeof MediaMetadata === 'undefined') return;
+        if (musicAdShowing(player)) {
+            // Ad metadata and position belong to the site's own module.
+            musicState.owns = false;
+            return;
+        }
+        var track = musicTrackData(player);
+        if (!track.title) return;
+        if (IS_IOS) video.setAttribute('title', track.title);
+        // Keep lock-screen seeking deterministic even when YTM owns metadata.
+        // These handlers preserve the site's meaning and only call its player API.
+        installMusicActionHandlers(player, session);
+        var current = session.metadata;
+        var currentTitle = current && current.title || '';
+        var stockOwns = !!current && currentTitle === track.title && current !== musicState.published;
+        if (stockOwns) {
+            musicState.owns = false;
+            musicState.published = null;
+            return;
+        }
+        var stale = !current || currentTitle !== track.title ||
+            (current === musicState.published && musicState.publishedId !== track.id);
+        if (stale) {
+            var init = { title: track.title, artist: track.artist, album: track.album };
+            if (track.artwork.length) init.artwork = track.artwork;
+            var metadata;
+            try { metadata = new MediaMetadata(init); }
+            catch (e) {
+                delete init.artwork;
+                try { metadata = new MediaMetadata(init); } catch (ignored) { return; }
+            }
+            try { session.metadata = metadata; } catch (e) { return; }
+            musicState.published = metadata;
+            musicState.publishedId = track.id;
+            musicState.owns = true;
+            log('YouTube Music Now Playing published:', track.title);
+        }
+        if (!musicState.owns) return;
+        try { session.playbackState = video.ended ? 'none' : (video.paused ? 'paused' : 'playing'); } catch (e) { /* ignore */ }
+        publishMusicPosition(player, video);
+    }
+
+    // Stock meaning only: every handler forwards to the player API, and nothing
+    // resumes playback on its own, so a pause from the lock screen stays paused.
+    function installMusicActionHandlers(player, session) {
+        if (typeof session.setActionHandler !== 'function') return;
+        function call(name, args) {
+            try { if (typeof player[name] === 'function') player[name].apply(player, args || []); } catch (e) { /* ignore */ }
+        }
+        function seekBy(offset) {
+            var amount = Number(offset);
+            if (!isFinite(amount) || amount === 0) amount = 10;
+            try { call('seekTo', [Math.max(0, player.getCurrentTime() + amount)]); } catch (e) { /* ignore */ }
+        }
+        var handlers = {
+            play: function () { call('playVideo'); },
+            pause: function () { call('pauseVideo'); },
+            seekbackward: function (details) { seekBy(-(details && details.seekOffset || 10)); },
+            seekforward: function (details) { seekBy(details && details.seekOffset || 10); },
+            seekto: function (details) { if (details && isFinite(details.seekTime)) call('seekTo', [details.seekTime]); },
+            nexttrack: function () { call('nextVideo'); },
+            previoustrack: function () { call('previousVideo'); }
+        };
+        for (var action in handlers) {
+            try { session.setActionHandler(action, handlers[action]); } catch (e) { /* unsupported action */ }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -607,7 +1110,7 @@
                 localStorage.removeItem(STORAGE_POSITION + videoId);
             } else if (isFinite(time)) {
                 if (time > 0.25) {
-                    localStorage.setItem(STORAGE_POSITION + videoId, JSON.stringify({ time: time, updatedAt: Date.now() }));
+                    storageSet(STORAGE_POSITION + videoId, JSON.stringify({ time: time, updatedAt: Date.now() }));
                 } else {
                     localStorage.removeItem(STORAGE_POSITION + videoId);
                 }
@@ -652,7 +1155,7 @@
             stateApplied = true;
             try {
                 if (carried.paused) video.pause();
-                else if (video.paused) {
+                else if (video.paused && !video.ended) {
                     var request = video.play();
                     if (request && request.catch) request.catch(function () { /* autoplay policy */ });
                 }
@@ -985,6 +1488,7 @@
         });
 
         setupVideoAspectLayout(player, video);
+        setupPinchFullscreen(player, video);
         // Keep YouTube's media listeners intact. SABR/MSE uses waiting,
         // stalled, progress, and related events to maintain the stream. The
         // iOS toolbar contains only a compact quality selector positioned above
@@ -1005,6 +1509,8 @@
         var session = navigator.mediaSession;
         var positionTimer = null;
         var metadataTimer = null;
+        var hadVideoTitle = video.hasAttribute('title');
+        var originalVideoTitle = video.getAttribute('title');
 
         function meta(name) {
             var element = document.querySelector('meta[property="' + name + '"],meta[name="' + name + '"]');
@@ -1051,6 +1557,7 @@
         function refreshMetadata() {
             if (mediaSessionOwner !== video) return;
             var data = metadataData();
+            if (IS_IOS && data.title) video.setAttribute('title', data.title);
             var metadata;
             try { metadata = new MediaMetadata(data); }
             catch (e) {
@@ -1120,7 +1627,7 @@
                         else video.currentTime = details.seekTime;
                     } catch (e) { /* ignore */ }
                 },
-                stop: function () { try { video.pause(); video.currentTime = 0; } catch (e) {} }
+                stop: function () { try { video.pause(); if (!video.ended) video.currentTime = 0; } catch (e) {} }
             };
             video._wblockMediaActions = Object.keys(actions);
             for (var action in actions) {
@@ -1174,6 +1681,8 @@
             try { session.playbackState = 'none'; } catch (e) { /* ignore */ }
             video._wblockMediaMetadata = null;
             video._wblockMediaActions = null;
+            if (hadVideoTitle) video.setAttribute('title', originalVideoTitle || '');
+            else video.removeAttribute('title');
         });
     }
 
@@ -1374,7 +1883,7 @@
         var english = {
             title: 'SponsorBlock settings', enabled: 'Enable SponsorBlock', notice: 'Show Undo after automatic skips',
             duration: 'Minimum segment length', current: 'Disable for this video', channel: 'Disable on this channel', reset: 'Reset defaults',
-            using: 'Using SponsorBlock',
+            using: 'Using SponsorBlock', donate: 'Donate',
             hideControls: 'Hide these controls (double-tap the video to show them)',
             any: 'Any length', auto: 'Auto skip', ask: 'Show skip button', off: 'Disabled',
             skipped: 'segment skipped', segment: 'segment', undo: 'Undo', skip: 'Skip',
@@ -1399,7 +1908,10 @@
             it:'Usa SponsorBlock', pt:'Usa SponsorBlock', ja:'SponsorBlockを使用', ko:'SponsorBlock 사용',
             ru:'Использует SponsorBlock', zh:'使用 SponsorBlock' };
         if (!selected.channel) selected.channel = channelLabels[language] || english.channel;
+        var donateLabels = { de:'Spenden', es:'Donar', fr:'Faire un don', it:'Dona', pt:'Doar', ja:'寄付', ko:'기부',
+            ru:'Поддержать', zh:'捐款' };
         if (!selected.using) selected.using = usingLabels[language] || english.using;
+        if (!selected.donate) selected.donate = donateLabels[language] || english.donate;
         var hideControlsLabels = { de:'Diese Steuerelemente ausblenden (Doppeltippen auf das Video zeigt sie)',
             es:'Ocultar estos controles (toca dos veces el vídeo para mostrarlos)',
             fr:'Masquer ces commandes (touchez deux fois la vidéo pour les afficher)',
@@ -1439,7 +1951,7 @@
 
     function saveSponsorBlockSettings(settings) {
         sponsorBlockSettingsCache = settings;
-        try { localStorage.setItem(SPONSORBLOCK_SETTINGS_KEY, JSON.stringify(settings)); } catch (e) { /* ignore */ }
+        storageSet(SPONSORBLOCK_SETTINGS_KEY, JSON.stringify(settings));
         document.dispatchEvent(new CustomEvent('wblock-tc-sponsor-settings'));
     }
 
@@ -1530,7 +2042,6 @@
 
     var DEARROW_API = 'https://sponsor.ajay.app/api/branding';
     var DEARROW_THUMBNAIL_API = 'https://dearrow-thumb.ajay.app/api/v1/getThumbnail';
-    var DEARROW_SETTINGS_KEY = 'wblock.tubeCleaner.deArrow';
     var DEARROW_CARD_SELECTOR = [
         'ytd-rich-grid-media', 'ytd-video-renderer', 'ytd-compact-video-renderer',
         'ytd-grid-video-renderer', 'ytd-playlist-video-renderer', 'yt-lockup-view-model',
@@ -1544,7 +2055,6 @@
         'ytm-watch-metadata h1',
         'h1.title yt-formatted-string'
     ].join(',');
-    var deArrowSettingsCache = null;
     var deArrowBrandingCache = {};
     var deArrowBrandingCacheOrder = [];
     var deArrowActiveRequests = {};
@@ -1552,58 +2062,23 @@
     var deArrowPendingScanRoots = [];
     var deArrowScanScheduled = false;
 
-    function defaultDeArrowSettings() {
-        return {
+    // Settings come from the wBlock app, which prepends them to the script
+    // as __wblockTubeCleanerDeArrow (Userscripts page, Tube Cleaner row).
+    // Older wBlock builds do not inject the constant; DeArrow stays off there.
+    function loadDeArrowSettings() {
+        var settings = {
             enabled: false,
             replaceTitles: true,
             replaceThumbnails: true,
             randomThumbnails: false,
-            showOriginalOnHover: true,
-            excludedChannels: []
+            showOriginalOnHover: true
         };
-    }
-
-    function loadDeArrowSettings() {
-        if (deArrowSettingsCache) return deArrowSettingsCache;
-        var settings = defaultDeArrowSettings();
-        try {
-            var saved = JSON.parse(localStorage.getItem(DEARROW_SETTINGS_KEY) || '{}');
-            ['enabled', 'replaceTitles', 'replaceThumbnails', 'randomThumbnails', 'showOriginalOnHover'].forEach(function (key) {
-                if (typeof saved[key] === 'boolean') settings[key] = saved[key];
-            });
-            if (Array.isArray(saved.excludedChannels)) settings.excludedChannels = saved.excludedChannels.filter(function (id) {
-                return typeof id === 'string' && id.length < 200;
-            }).slice(0, 200);
-        } catch (e) { /* use defaults */ }
-        deArrowSettingsCache = settings;
+        var injected = typeof __wblockTubeCleanerDeArrow === 'object' ? __wblockTubeCleanerDeArrow : null;
+        if (!injected) return settings;
+        for (var key in settings) {
+            if (typeof injected[key] === 'boolean') settings[key] = injected[key];
+        }
         return settings;
-    }
-
-    function saveDeArrowSettings(settings) {
-        deArrowSettingsCache = settings;
-        try { localStorage.setItem(DEARROW_SETTINGS_KEY, JSON.stringify(settings)); } catch (e) { /* ignore */ }
-    }
-
-    function deArrowLocale() {
-        var language = (navigator.language || 'en').toLowerCase().split('-')[0];
-        var english = {
-            title: 'DeArrow settings', enabled: 'Enable DeArrow', titles: 'Replace titles',
-            thumbnails: 'Replace thumbnails', random: 'Use a random frame when no thumbnail is submitted',
-            hover: 'Show originals when hovering over a video', channel: 'Disable on this channel',
-            reset: 'Reset defaults', using: 'Using DeArrow'
-        };
-        var translations = {
-            de: { title:'DeArrow-Einstellungen',enabled:'DeArrow aktivieren',titles:'Titel ersetzen',thumbnails:'Vorschaubilder ersetzen',random:'Zufälliges Einzelbild verwenden, wenn kein Vorschaubild eingereicht wurde',hover:'Originale beim Bewegen über ein Video anzeigen',channel:'Auf diesem Kanal deaktivieren',reset:'Zurücksetzen',using:'Verwendet DeArrow' },
-            es: { title:'Ajustes de DeArrow',enabled:'Activar DeArrow',titles:'Sustituir títulos',thumbnails:'Sustituir miniaturas',random:'Usar un fotograma aleatorio si no se ha enviado una miniatura',hover:'Mostrar originales al pasar sobre un vídeo',channel:'Desactivar en este canal',reset:'Restablecer',using:'Usa DeArrow' },
-            fr: { title:'Réglages DeArrow',enabled:'Activer DeArrow',titles:'Remplacer les titres',thumbnails:'Remplacer les miniatures',random:'Utiliser une image aléatoire si aucune miniature n’a été proposée',hover:'Afficher les originaux au survol d’une vidéo',channel:'Désactiver sur cette chaîne',reset:'Réinitialiser',using:'Utilise DeArrow' },
-            it: { title:'Impostazioni DeArrow',enabled:'Attiva DeArrow',titles:'Sostituisci titoli',thumbnails:'Sostituisci miniature',random:'Usa un fotogramma casuale se non è stata inviata una miniatura',hover:'Mostra gli originali passando su un video',channel:'Disattiva su questo canale',reset:'Ripristina',using:'Usa DeArrow' },
-            pt: { title:'Configurações do DeArrow',enabled:'Ativar DeArrow',titles:'Substituir títulos',thumbnails:'Substituir miniaturas',random:'Usar um quadro aleatório quando nenhuma miniatura for enviada',hover:'Mostrar originais ao passar sobre um vídeo',channel:'Desativar neste canal',reset:'Restaurar padrões',using:'Usa DeArrow' },
-            ja: { title:'DeArrow設定',enabled:'DeArrowを有効にする',titles:'タイトルを置き換える',thumbnails:'サムネイルを置き換える',random:'サムネイルが投稿されていない場合はランダムなフレームを使う',hover:'動画にカーソルを合わせたとき元を表示',channel:'このチャンネルでは無効にする',reset:'初期設定に戻す',using:'DeArrowを使用' },
-            ko: { title:'DeArrow 설정',enabled:'DeArrow 활성화',titles:'제목 바꾸기',thumbnails:'미리보기 이미지 바꾸기',random:'제출된 미리보기가 없으면 임의의 프레임 사용',hover:'동영상 위에 마우스를 놓으면 원본 표시',channel:'이 채널에서 비활성화',reset:'기본값으로 재설정',using:'DeArrow 사용' },
-            ru: { title:'Настройки DeArrow',enabled:'Включить DeArrow',titles:'Заменять названия',thumbnails:'Заменять значки',random:'Использовать случайный кадр, если миниатюра не предложена',hover:'Показывать оригиналы при наведении на видео',channel:'Отключить на этом канале',reset:'Сбросить',using:'Использует DeArrow' },
-            zh: { title:'DeArrow 设置',enabled:'启用 DeArrow',titles:'替换标题',thumbnails:'替换缩略图',random:'没有提交缩略图时使用随机画面',hover:'悬停视频时显示原始内容',channel:'对这个频道停用',reset:'恢复默认设置',using:'使用 DeArrow' }
-        };
-        return translations[language] || english;
     }
 
     function cachedDeArrowBranding(videoId) {
@@ -1724,19 +2199,6 @@
         return null;
     }
 
-    function deArrowCardChannelId(card) {
-        var direct = card.getAttribute('data-channel-id');
-        if (direct) return direct;
-        var link = card.querySelector('a[href^="/@"],a[href^="/channel/"],a[href^="/c/"],a[href^="/user/"]');
-        if (!link) return null;
-        try { return new URL(link.getAttribute('href'), location.href).pathname; }
-        catch (e) { return null; }
-    }
-
-    function deArrowChannelExcluded(settings, channelId) {
-        return !!(channelId && settings.excludedChannels.indexOf(channelId) !== -1);
-    }
-
     function findDeArrowCardTitle(card) {
         var selectors = [
             '#video-title yt-formatted-string', 'yt-formatted-string#video-title',
@@ -1790,39 +2252,108 @@
         else element.setAttribute(name, value);
     }
 
-    function applyDeArrowThumbnailElement(element, videoId, timestamp) {
-        if (!element) return;
-        var url = DEARROW_THUMBNAIL_API + '?videoID=' + encodeURIComponent(videoId) +
+    function deArrowThumbnailUrl(videoId, timestamp) {
+        return DEARROW_THUMBNAIL_API + '?videoID=' + encodeURIComponent(videoId) +
             '&time=' + encodeURIComponent(String(timestamp));
-        if (element._wblockDeArrowOriginalSrc === undefined) {
-            element._wblockDeArrowOriginalSrc = element.getAttribute('src');
-            element._wblockDeArrowOriginalSrcset = element.getAttribute('srcset');
-            element._wblockDeArrowOriginalReferrerPolicy = element.getAttribute('referrerpolicy');
-        } else if (!element._wblockDeArrowShowingOriginal && element.getAttribute('src') !== url &&
-            element.getAttribute('src') !== element._wblockDeArrowOriginalSrc) {
-            // YouTube recycles card image elements as the feed changes. Preserve
-            // its newly assigned original before applying the cached thumbnail.
-            element._wblockDeArrowOriginalSrc = element.getAttribute('src');
-            element._wblockDeArrowOriginalSrcset = element.getAttribute('srcset');
-            element._wblockDeArrowOriginalReferrerPolicy = element.getAttribute('referrerpolicy');
-            delete element._wblockDeArrowThumbnailFailed;
+    }
+
+    // The thumbnail server may answer with a frame from a different time than
+    // the one requested and reports the time it used in X-Timestamp. The API
+    // docs require comparing that header with the branding timestamp and
+    // requesting once more at the server's time when they differ, so the image
+    // is fetched here rather than assigned straight to the element's src.
+    function fetchDeArrowThumbnail(videoId, timestamp, retried) {
+        var url = deArrowThumbnailUrl(videoId, timestamp);
+        if (!window.fetch || !window.URL || typeof URL.createObjectURL !== 'function') return Promise.resolve(null);
+        return fetch(url, { referrerPolicy: 'no-referrer' }).then(function (response) {
+            if (response.status !== 200) {
+                throw new Error('DeArrow thumbnail HTTP ' + response.status + ' ' +
+                    (response.headers.get('X-Failure-Reason') || ''));
+            }
+            var served = parseFloat(response.headers.get('X-Timestamp'));
+            if (!retried && isFinite(served) && served >= 0 && Math.abs(served - timestamp) > 0.001) {
+                log('DeArrow thumbnail served at', served, 'instead of', timestamp);
+                return fetchDeArrowThumbnail(videoId, served, true);
+            }
+            return response.blob().then(function (blob) {
+                return { url: url, objectUrl: URL.createObjectURL(blob) };
+            });
+        }).catch(function (error) {
+            log('DeArrow thumbnail unavailable', error);
+            return null;
+        });
+    }
+
+    function releaseDeArrowThumbnail(element) {
+        var src = element._wblockDeArrowCustomSrc;
+        if (src && src.indexOf('blob:') === 0) {
+            try { URL.revokeObjectURL(src); } catch (e) { /* ignore */ }
         }
-        element._wblockDeArrowCustomSrc = url;
-        element.setAttribute('data-wblock-dearrow-thumbnail', '');
-        if (element._wblockDeArrowThumbnailFailed === url || element._wblockDeArrowShowingOriginal) return;
+        delete element._wblockDeArrowCustomSrc;
+        delete element._wblockDeArrowRequestedUrl;
+        delete element._wblockDeArrowThumbnailFailed;
+    }
+
+    function showDeArrowThumbnail(element) {
+        if (!element._wblockDeArrowCustomSrc) return;
         element.removeAttribute('srcset');
         element.setAttribute('referrerpolicy', 'no-referrer');
-        if (element.getAttribute('src') !== url) element.setAttribute('src', url);
+        if (element.getAttribute('src') !== element._wblockDeArrowCustomSrc) {
+            element.setAttribute('src', element._wblockDeArrowCustomSrc);
+        }
+    }
+
+    function applyDeArrowThumbnailElement(element, videoId, timestamp) {
+        if (!element) return;
+        var url = deArrowThumbnailUrl(videoId, timestamp);
+        var currentSrc = element.getAttribute('src');
+        if (element._wblockDeArrowOriginalSrc === undefined) {
+            element._wblockDeArrowOriginalSrc = currentSrc;
+            element._wblockDeArrowOriginalSrcset = element.getAttribute('srcset');
+            element._wblockDeArrowOriginalReferrerPolicy = element.getAttribute('referrerpolicy');
+        } else if (!element._wblockDeArrowShowingOriginal && currentSrc !== element._wblockDeArrowCustomSrc &&
+            currentSrc !== element._wblockDeArrowOriginalSrc) {
+            // YouTube recycles card image elements as the feed changes. Preserve
+            // its newly assigned original before applying the cached thumbnail.
+            element._wblockDeArrowOriginalSrc = currentSrc;
+            element._wblockDeArrowOriginalSrcset = element.getAttribute('srcset');
+            element._wblockDeArrowOriginalReferrerPolicy = element.getAttribute('referrerpolicy');
+            releaseDeArrowThumbnail(element);
+        }
+        if (!element.hasAttribute('data-wblock-dearrow-thumbnail')) element.setAttribute('data-wblock-dearrow-thumbnail', '');
+        if (element._wblockDeArrowThumbnailFailed === url || element._wblockDeArrowShowingOriginal) return;
         if (!element._wblockDeArrowErrorHooked) {
             element._wblockDeArrowErrorHooked = true;
             element.addEventListener('error', function () {
-                if (element.getAttribute('src') !== element._wblockDeArrowCustomSrc) return;
-                element._wblockDeArrowThumbnailFailed = element._wblockDeArrowCustomSrc;
+                if (!element._wblockDeArrowCustomSrc || element.getAttribute('src') !== element._wblockDeArrowCustomSrc) return;
+                var failedUrl = element._wblockDeArrowRequestedUrl;
+                releaseDeArrowThumbnail(element);
+                element._wblockDeArrowThumbnailFailed = failedUrl;
                 restoreDeArrowAttribute(element, 'src', element._wblockDeArrowOriginalSrc);
                 restoreDeArrowAttribute(element, 'srcset', element._wblockDeArrowOriginalSrcset);
                 restoreDeArrowAttribute(element, 'referrerpolicy', element._wblockDeArrowOriginalReferrerPolicy);
             });
         }
+        if (element._wblockDeArrowRequestedUrl === url) {
+            showDeArrowThumbnail(element);
+            return;
+        }
+        releaseDeArrowThumbnail(element);
+        element._wblockDeArrowRequestedUrl = url;
+        fetchDeArrowThumbnail(videoId, timestamp, false).then(function (result) {
+            if (element._wblockDeArrowRequestedUrl !== url) {
+                if (result) { try { URL.revokeObjectURL(result.objectUrl); } catch (e) { /* ignore */ } }
+                return;
+            }
+            if (!result) {
+                // The original YouTube thumbnail was never replaced, so it stays.
+                element._wblockDeArrowThumbnailFailed = url;
+                return;
+            }
+            element._wblockDeArrowCustomSrc = result.objectUrl;
+            element.setAttribute('data-wblock-dearrow-thumbnail', result.url);
+            if (!element._wblockDeArrowShowingOriginal) showDeArrowThumbnail(element);
+        });
     }
 
     function restoreDeArrowThumbnailElement(element) {
@@ -1833,8 +2364,7 @@
         delete element._wblockDeArrowOriginalSrc;
         delete element._wblockDeArrowOriginalSrcset;
         delete element._wblockDeArrowOriginalReferrerPolicy;
-        delete element._wblockDeArrowCustomSrc;
-        delete element._wblockDeArrowThumbnailFailed;
+        releaseDeArrowThumbnail(element);
         delete element._wblockDeArrowShowingOriginal;
         element.removeAttribute('data-wblock-dearrow-thumbnail');
     }
@@ -1861,7 +2391,7 @@
         card._wblockDeArrowMouseLeave = function () {
             card._wblockDeArrowShowingOriginal = false;
             var settings = loadDeArrowSettings();
-            if (!settings.enabled || deArrowChannelExcluded(settings, deArrowCardChannelId(card))) return;
+            if (!settings.enabled) return;
             var title = card._wblockDeArrowTitleElement;
             var image = card._wblockDeArrowThumbnailElement;
             if (title) {
@@ -1871,10 +2401,8 @@
             if (image) {
                 image._wblockDeArrowShowingOriginal = false;
                 if (settings.replaceThumbnails && image._wblockDeArrowCustomSrc &&
-                    image._wblockDeArrowThumbnailFailed !== image._wblockDeArrowCustomSrc) {
-                    image.removeAttribute('srcset');
-                    image.setAttribute('referrerpolicy', 'no-referrer');
-                    image.setAttribute('src', image._wblockDeArrowCustomSrc);
+                    image._wblockDeArrowThumbnailFailed !== image._wblockDeArrowRequestedUrl) {
+                    showDeArrowThumbnail(image);
                 }
             }
         };
@@ -1909,7 +2437,7 @@
             restoreDeArrowCard(card);
         }
         var settings = loadDeArrowSettings();
-        if (!settings.enabled || deArrowChannelExcluded(settings, deArrowCardChannelId(card))) {
+        if (!settings.enabled) {
             restoreDeArrowCard(card);
             return;
         }
@@ -1918,7 +2446,7 @@
         fetchDeArrowBranding(videoId, false).then(function (branding) {
             if (!card.isConnected || card._wblockDeArrowRequestedVideoId !== videoId) return;
             var currentSettings = loadDeArrowSettings();
-            if (!currentSettings.enabled || deArrowChannelExcluded(currentSettings, deArrowCardChannelId(card))) {
+            if (!currentSettings.enabled) {
                 restoreDeArrowCard(card);
                 return;
             }
@@ -1958,7 +2486,7 @@
             var titleNeedsRepair = title && title._wblockDeArrowCustomText &&
                 title.textContent !== title._wblockDeArrowCustomText;
             var imageNeedsRepair = image && image._wblockDeArrowCustomSrc &&
-                image._wblockDeArrowThumbnailFailed !== image._wblockDeArrowCustomSrc &&
+                image._wblockDeArrowThumbnailFailed !== image._wblockDeArrowRequestedUrl &&
                 image.getAttribute('src') !== image._wblockDeArrowCustomSrc;
             if (!titleNeedsRepair && !imageNeedsRepair) return;
             applyDeArrowCard(card);
@@ -1990,12 +2518,10 @@
     function applyCurrentDeArrowTitle() {
         var settings = loadDeArrowSettings();
         var videoId = sponsorBlockVideoId();
-        var channelId = sponsorBlockChannelId();
-        if (!settings.enabled || !settings.replaceTitles || !videoId || deArrowChannelExcluded(settings, channelId)) return;
+        if (!settings.enabled || !settings.replaceTitles || !videoId) return;
         fetchDeArrowBranding(videoId, true).then(function (branding) {
             var currentSettings = loadDeArrowSettings();
-            if (!currentSettings.enabled || !currentSettings.replaceTitles || sponsorBlockVideoId() !== videoId ||
-                deArrowChannelExcluded(currentSettings, sponsorBlockChannelId())) return;
+            if (!currentSettings.enabled || !currentSettings.replaceTitles || sponsorBlockVideoId() !== videoId) return;
             var customTitle = deArrowAcceptedTitle(branding);
             if (!customTitle) return;
             var titles = document.querySelectorAll(DEARROW_WATCH_TITLE_SELECTOR);
@@ -2566,6 +3092,14 @@
         }).then(captionTracksFromResponse).catch(function () { return []; });
     }
 
+    // YouTube's auto-generated tracks tag every cue with "align:start
+    // position:0%", which its own renderer ignores but Safari honours, so the
+    // text hugs the bottom-left corner. Drop the cue settings so the native
+    // renderer centres each cue like the manual tracks.
+    function normalizeCaptionVtt(text) {
+        return text.replace(/^(\d{1,2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{1,2}:\d{2}:\d{2}\.\d{3})[ \t][^\r\n]*/gm, '$1');
+    }
+
     function downloadNativeSubtitleTracks(tracks, signal) {
         return Promise.all(tracks.map(function (track) {
             var url = captionUrl(track);
@@ -2576,7 +3110,7 @@
             }).then(function (text) {
                 text = String(text || '').replace(/^\uFEFF/, '');
                 if (text.slice(0, 6) !== 'WEBVTT' || text.indexOf('-->') === -1 || text.length > 5000000) return null;
-                return { definition: track, vtt: text };
+                return { definition: track, vtt: normalizeCaptionVtt(text) };
             }).catch(function () { return null; });
         })).then(function (results) {
             return results.filter(function (result) { return !!result; });
@@ -2673,11 +3207,70 @@
         // page's rendering updates. A genuinely hidden tab stops those
         // updates, so the PiP window keeps showing the last painted line even
         // though playback and cue timing continue. The media element still
-        // fires timeupdate while hidden; watch for cue boundaries there and
-        // cycle the showing track's mode, which makes WebKit resolve and
-        // paint the current cue again. Cycling only at boundaries keeps the
-        // foreground path untouched and avoids flicker.
+        // fires timeupdate and cuechange while hidden; watch for cue
+        // boundaries there and cycle the showing track's mode, which makes
+        // WebKit resolve and paint the current cue again. The two halves of
+        // the cycle run in separate tasks: a same-task hidden/showing flip
+        // coalesces into a no-op configuration change and repaints nothing.
+        // A low-rate interval backs up the events in case the throttled
+        // background page delivers them late. Cycling only at boundaries
+        // keeps the foreground path untouched and avoids flicker.
         var pipCueSignature = null;
+        var pipPumpRestorePending = false;
+        var pipPumpRestoreTimer = null;
+        var pipPumpInterval = null;
+        function restoreTrackMode(track) {
+            if (!pipPumpRestorePending) return;
+            pipPumpRestorePending = false;
+            if (pipPumpRestoreTimer !== null) { clearTimeout(pipPumpRestoreTimer); pipPumpRestoreTimer = null; }
+            if (cancelled) return;
+            try { if (track.mode === 'hidden') track.mode = 'showing'; } catch (e) { /* ignore */ }
+            // Force the layout that WebKit's PiP caption image is painted from.
+            try { void video.offsetWidth; } catch (e) { /* ignore */ }
+        }
+        function cycleTrackMode(track) {
+            if (pipPumpRestorePending) return;
+            pipPumpRestorePending = true;
+            track.mode = 'hidden';
+            pipCaptionPumpTicks++;
+            // A hidden macOS tab aligns timers to whole seconds or longer, so
+            // a setTimeout restore can leave the track hidden for a long
+            // time. Message events are ordinary tasks and are not throttled;
+            // the timer only backs them up.
+            try {
+                if (typeof MessageChannel === 'function') {
+                    var channel = new MessageChannel();
+                    channel.port1.onmessage = function () {
+                        try { channel.port1.close(); } catch (e) { /* ignore */ }
+                        restoreTrackMode(track);
+                    };
+                    channel.port2.postMessage(0);
+                }
+            } catch (e) { /* fall through to the timer */ }
+            pipPumpRestoreTimer = setTimeout(function () {
+                pipPumpRestoreTimer = null;
+                restoreTrackMode(track);
+            }, 0);
+        }
+        // Safari's track menu and the C shortcut both pick tracks; if two
+        // subtitle tracks end up showing at once the text renders twice.
+        // Keep only the most recently enabled one.
+        var showingBefore = [];
+        function enforceSingleSubtitleTrack() {
+            var showing = nativeSubtitleTracks(video).filter(function (track) { return track.mode === 'showing'; });
+            if (showing.length > 1) {
+                var keep = null;
+                for (var i = 0; i < showing.length; i++) {
+                    if (showingBefore.indexOf(showing[i]) === -1) { keep = showing[i]; break; }
+                }
+                if (!keep) keep = showing[showing.length - 1];
+                for (var j = 0; j < showing.length; j++) {
+                    if (showing[j] !== keep) { try { showing[j].mode = 'disabled'; } catch (e) { /* ignore */ } }
+                }
+                showing = [keep];
+            }
+            showingBefore = showing;
+        }
         function activeCueSignature(track, time) {
             var cues = track.cues;
             if (!cues) return '';
@@ -2700,18 +3293,31 @@
                 var signature = activeCueSignature(track, video.currentTime);
                 if (pipCueSignature === signature) return;
                 pipCueSignature = signature;
-                track.mode = 'hidden';
-                track.mode = 'showing';
-                pipCaptionPumpTicks++;
+                cycleTrackMode(track);
                 return;
             }
         }
+        function onTrackAdded(event) {
+            if (event && event.track) event.track.addEventListener('cuechange', onPiPCaptionTick);
+        }
         video.addEventListener('timeupdate', onPiPCaptionTick);
+        if (video.textTracks && typeof video.textTracks.addEventListener === 'function') {
+            video.textTracks.addEventListener('addtrack', onTrackAdded);
+            video.textTracks.addEventListener('change', enforceSingleSubtitleTrack);
+        }
+        pipPumpInterval = setInterval(onPiPCaptionTick, 500);
 
         registerCleanup(function () {
             cancelled = true;
             stopRetry();
             video.removeEventListener('timeupdate', onPiPCaptionTick);
+            if (video.textTracks && typeof video.textTracks.removeEventListener === 'function') {
+                video.textTracks.removeEventListener('addtrack', onTrackAdded);
+                video.textTracks.removeEventListener('change', enforceSingleSubtitleTrack);
+            }
+            if (pipPumpInterval !== null) { clearInterval(pipPumpInterval); pipPumpInterval = null; }
+            pipPumpRestorePending = false;
+            if (pipPumpRestoreTimer !== null) { clearTimeout(pipPumpRestoreTimer); pipPumpRestoreTimer = null; }
             if (controller) controller.abort();
             for (var i = 0; i < elements.length; i++) {
                 if (elements[i].parentNode) elements[i].remove();
@@ -2847,6 +3453,10 @@
     }
 
     function transformPlayer() {
+        // YouTube Music owns a complete responsive player and Media Session.
+        // Native controls are invisible in song mode and duplicate its transport
+        // in video mode, so the Music integration is background playback only.
+        if (IS_YOUTUBE_MUSIC) return;
         if (isShortsPath()) {
             suspendForShorts();
             return;
@@ -3322,8 +3932,10 @@
         var servicesRow = document.createElement('div');
         servicesRow.className = 'wblock-tc-services-row';
         servicesRow.style.cssText = 'display:flex;gap:6px;align-items:center;justify-content:' + rowJustify;
-        toolbar.appendChild(playbackRow);
+        // Services (SB) sit on top; the quality picker is the row nearest the
+        // native control strip so the pill people reach for most is lowest.
         toolbar.appendChild(servicesRow);
+        toolbar.appendChild(playbackRow);
 
         // Quality selector
         var qualityBtn = document.createElement('button');
@@ -3422,10 +4034,6 @@
             if (sponsorMenu) {
                 sponsorMenu.style.display = 'none';
                 if (sponsorBtn) sponsorBtn.setAttribute('aria-expanded', 'false');
-            }
-            if (deArrowMenu) {
-                deArrowMenu.style.display = 'none';
-                if (deArrowBtn) deArrowBtn.setAttribute('aria-expanded', 'false');
             }
             if (qualityMenu.style.display === 'none') {
                 buildQualityMenu();
@@ -3586,7 +4194,7 @@
             }));
             // Whole-toolbar visibility preference. It lives here because this
             // is the only settings surface Tube Cleaner has; it hides the
-            // quality, SB, and DA pills together on this device.
+            // quality and SB pills together on this device.
             sponsorMenu.appendChild(sponsorCheckboxRow(locale.hideControls, isToolbarHidden(), function (checked) {
                 setToolbarHidden(checked);
             }));
@@ -3640,31 +4248,28 @@
                 updateSponsorButton();
                 buildSponsorMenu();
             });
+            // SponsorBlock data is CC BY-NC-SA 4.0; the credit link is a license term.
+            var credits = document.createElement('span');
+            credits.style.cssText = 'display:inline-flex;gap:10px';
             var credit = document.createElement('a');
             credit.href = 'https://sponsor.ajay.app/'; credit.target = '_blank'; credit.rel = 'noopener noreferrer';
             credit.textContent = locale.using; credit.style.cssText = 'color:#69a9ff;text-decoration:none';
-            footer.appendChild(reset); footer.appendChild(credit); sponsorMenu.appendChild(footer);
+            var donate = document.createElement('a');
+            donate.href = 'https://sponsor.ajay.app/donate/'; donate.target = '_blank'; donate.rel = 'noopener noreferrer';
+            donate.textContent = locale.donate; donate.style.cssText = 'color:#69a9ff;text-decoration:none';
+            credits.appendChild(credit); credits.appendChild(donate);
+            footer.appendChild(reset); footer.appendChild(credits); sponsorMenu.appendChild(footer);
         }
 
         sponsorBtn.addEventListener('click', function (e) {
             e.stopPropagation();
             qualityMenu.style.display = 'none';
-            if (deArrowMenu) {
-                deArrowMenu.style.display = 'none';
-                if (deArrowBtn) deArrowBtn.setAttribute('aria-expanded', 'false');
-            }
             if (sponsorMenu.style.display === 'none') {
                 buildSponsorMenu();
-                // SB sits left of DA in the service row; align its panel with
-                // the row's right edge so the wider desktop panel stays on-screen.
                 if (IS_IOS) {
                     showMobilePageOverlay(sponsorMenu, 700);
                 } else {
-                    placeDesktopAnchoredMenu(sponsorMenu, {
-                        maxHeight: '65vh',
-                        gap: '6px',
-                        upRight: deArrowWrap ? -(deArrowWrap.offsetWidth + 6) + 'px' : '0'
-                    });
+                    placeDesktopAnchoredMenu(sponsorMenu, { maxHeight: '65vh', gap: '6px' });
                 }
                 sponsorMenu.style.display = 'block';
                 sponsorBtn.setAttribute('aria-expanded', 'true');
@@ -3682,147 +4287,6 @@
         registerCleanup(function () { document.removeEventListener('click', onSponsorOutsideClick); });
         updateSponsorButton();
 
-        // DeArrow settings. The small panel keeps the high-value replacement
-        // controls but leaves DeArrow's submission and formatting workflows to
-        // the full extension.
-        var deArrowWrap = document.createElement('div');
-        deArrowWrap.style.cssText = 'position:relative';
-        var deArrowBtn = document.createElement('button');
-        deArrowBtn.className = 'wblock-tc-dearrow-button';
-        deArrowBtn.type = 'button';
-        deArrowBtn.style.cssText = btnStyle;
-        deArrowBtn.textContent = 'DA';
-        deArrowBtn.setAttribute('aria-haspopup', 'dialog');
-        deArrowBtn.setAttribute('aria-expanded', 'false');
-        var deArrowMenu = document.createElement('div');
-        deArrowMenu.className = 'wblock-tc-dearrow-menu';
-        deArrowMenu.setAttribute('role', 'dialog');
-        deArrowMenu.setAttribute('aria-label', deArrowLocale().title);
-        deArrowMenu.style.cssText = 'position:absolute;bottom:100%;right:0;margin-bottom:6px;box-sizing:border-box;' +
-            'width:' + (IS_IOS ? 'min(340px,calc(100vw - 16px))' : '310px') + ';max-height:65vh;overflow:auto;' +
-            'background:rgba(22,22,24,.98);border:1px solid rgba(255,255,255,.14);border-radius:10px;' +
-            'padding:12px;color:#fff;display:none;z-index:80;font:' + (IS_IOS ? '14px' : '12px') +
-            '/1.35 -apple-system,system-ui,sans-serif;box-shadow:0 8px 28px rgba(0,0,0,.45);text-align:left';
-
-        function updateDeArrowButton() {
-            var settings = loadDeArrowSettings();
-            var enabled = settings.enabled && !deArrowChannelExcluded(settings, sponsorBlockChannelId());
-            deArrowBtn.style.color = enabled ? '#ffb347' : '#aaa';
-            deArrowBtn.title = deArrowLocale().title;
-            deArrowBtn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
-        }
-
-        function deArrowCheckboxRow(labelText, checked, disabled, settingName, onChange) {
-            var label = document.createElement('label');
-            label.style.cssText = 'display:flex;align-items:center;gap:8px;padding:7px 0;cursor:' +
-                (disabled ? 'default;opacity:.55' : 'pointer');
-            var input = document.createElement('input');
-            input.type = 'checkbox';
-            input.checked = checked;
-            input.disabled = disabled;
-            input.style.cssText = 'width:16px;height:16px;accent-color:#ffb347';
-            if (settingName) input.setAttribute('data-dearrow-setting', settingName);
-            input.addEventListener('change', function () { onChange(input.checked); });
-            var text = document.createElement('span');
-            text.textContent = labelText;
-            label.appendChild(input); label.appendChild(text);
-            return label;
-        }
-
-        function buildDeArrowMenu() {
-            while (deArrowMenu.firstChild) deArrowMenu.removeChild(deArrowMenu.firstChild);
-            var locale = deArrowLocale();
-            var settings = loadDeArrowSettings();
-            var heading = document.createElement('div');
-            heading.textContent = 'DeArrow';
-            heading.style.cssText = 'font-size:' + (IS_IOS ? '18px' : '15px') + ';font-weight:700;margin:0 0 7px';
-            deArrowMenu.appendChild(heading);
-            deArrowMenu.appendChild(deArrowCheckboxRow(locale.enabled, settings.enabled, false, 'enabled', function (checked) {
-                settings.enabled = checked;
-                saveDeArrowSettings(settings);
-                updateDeArrowButton();
-                buildDeArrowMenu();
-            }));
-            var divider = document.createElement('div');
-            divider.style.cssText = 'height:1px;background:rgba(255,255,255,.12);margin:5px 0';
-            deArrowMenu.appendChild(divider);
-            deArrowMenu.appendChild(deArrowCheckboxRow(locale.titles, settings.replaceTitles, !settings.enabled,
-                'replaceTitles', function (checked) {
-                    settings.replaceTitles = checked; saveDeArrowSettings(settings);
-                }));
-            deArrowMenu.appendChild(deArrowCheckboxRow(locale.thumbnails, settings.replaceThumbnails, !settings.enabled,
-                'replaceThumbnails', function (checked) {
-                    settings.replaceThumbnails = checked; saveDeArrowSettings(settings);
-                }));
-            deArrowMenu.appendChild(deArrowCheckboxRow(locale.random, settings.randomThumbnails,
-                !settings.enabled || !settings.replaceThumbnails, 'randomThumbnails', function (checked) {
-                    settings.randomThumbnails = checked; saveDeArrowSettings(settings);
-                }));
-            deArrowMenu.appendChild(deArrowCheckboxRow(locale.hover, settings.showOriginalOnHover, !settings.enabled,
-                'showOriginalOnHover', function (checked) {
-                    settings.showOriginalOnHover = checked; saveDeArrowSettings(settings);
-                }));
-            var channelId = sponsorBlockChannelId();
-            if (channelId) {
-                var channelRow = deArrowCheckboxRow(locale.channel,
-                    settings.excludedChannels.indexOf(channelId) !== -1, !settings.enabled, 'channel', function (checked) {
-                        var index = settings.excludedChannels.indexOf(channelId);
-                        if (checked && index === -1) settings.excludedChannels.push(channelId);
-                        if (!checked && index !== -1) settings.excludedChannels.splice(index, 1);
-                        saveDeArrowSettings(settings);
-                        updateDeArrowButton();
-                    });
-                channelRow.setAttribute('data-dearrow-channel', channelId);
-                deArrowMenu.appendChild(channelRow);
-            }
-            var footer = document.createElement('div');
-            footer.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-top:8px;padding-top:8px;' +
-                'border-top:1px solid rgba(255,255,255,.12)';
-            var reset = document.createElement('button');
-            reset.type = 'button'; reset.textContent = locale.reset;
-            reset.style.cssText = 'background:transparent;color:#aaa;border:0;padding:3px 0;font:inherit;cursor:pointer';
-            reset.addEventListener('click', function () {
-                deArrowSettingsCache = defaultDeArrowSettings();
-                saveDeArrowSettings(deArrowSettingsCache);
-                updateDeArrowButton();
-                buildDeArrowMenu();
-            });
-            var credit = document.createElement('a');
-            credit.href = 'https://dearrow.ajay.app/'; credit.target = '_blank'; credit.rel = 'noopener noreferrer';
-            credit.textContent = locale.using; credit.style.cssText = 'color:#69a9ff;text-decoration:none';
-            footer.appendChild(reset); footer.appendChild(credit); deArrowMenu.appendChild(footer);
-        }
-
-        deArrowBtn.addEventListener('click', function (e) {
-            e.stopPropagation();
-            qualityMenu.style.display = 'none';
-            sponsorMenu.style.display = 'none';
-            sponsorBtn.setAttribute('aria-expanded', 'false');
-            if (deArrowMenu.style.display === 'none') {
-                buildDeArrowMenu();
-                if (IS_IOS) { showMobilePageOverlay(deArrowMenu, 520); }
-                else { placeDesktopAnchoredMenu(deArrowMenu, { maxHeight: '65vh', gap: '6px' }); }
-                deArrowMenu.style.display = 'block';
-                deArrowBtn.setAttribute('aria-expanded', 'true');
-            } else {
-                deArrowMenu.style.display = 'none';
-                deArrowBtn.setAttribute('aria-expanded', 'false');
-            }
-        });
-        deArrowMenu.addEventListener('click', function (e) { e.stopPropagation(); });
-        registerCleanup(function () {
-            removeMobilePageOverlay(qualityMenu);
-            removeMobilePageOverlay(sponsorMenu);
-            removeMobilePageOverlay(deArrowMenu);
-        });
-        function onDeArrowOutsideClick() {
-            deArrowMenu.style.display = 'none';
-            deArrowBtn.setAttribute('aria-expanded', 'false');
-        }
-        document.addEventListener('click', onDeArrowOutsideClick);
-        registerCleanup(function () { document.removeEventListener('click', onDeArrowOutsideClick); });
-        updateDeArrowButton();
-
         // PiP button is intentionally omitted — Safari's native controls
         // already provide PiP. Auto PiP handles automatic PiP entry.
 
@@ -3833,7 +4297,7 @@
         var toolbarUserHidden = isToolbarHidden();
         var toolbarRevealOverride = false;
         function anyToolbarPanelOpen() {
-            var panels = [qualityMenu];
+            var panels = [qualityMenu, sponsorMenu];
             return panels.some(function (p) {
                 return p && p.style.display !== 'none' && p.style.display !== '';
             });
@@ -3856,18 +4320,20 @@
                 if (toolbarSuppressed()) return;
                 toolbar.style.opacity = '1';
                 toolbar.style.setProperty('pointer-events', 'auto', 'important');
+                toolbar.classList.remove('wblock-tc-toolbar-hidden');
                 clearTimeout(toolbarTimer);
             }
             function hideToolbar() {
                 // Never hide while a settings panel is open — the controls
                 // that opened it must remain reachable to close it again.
-                var panels = [qualityMenu];
+                var panels = [qualityMenu, sponsorMenu];
                 var anyOpen = panels.some(function (p) {
                     return p && p.style.display !== 'none' && p.style.display !== '';
                 });
                 if (anyOpen) { scheduleHideToolbar(); return; }
                 toolbar.style.opacity = '0';
                 toolbar.style.setProperty('pointer-events', 'none', 'important');
+                toolbar.classList.add('wblock-tc-toolbar-hidden');
             }
             function scheduleHideToolbar() {
                 clearTimeout(toolbarTimer);
@@ -3935,6 +4401,7 @@
             if (toolbarUserHidden) {
                 toolbar.style.opacity = '0';
                 toolbar.style.setProperty('pointer-events', 'none', 'important');
+                toolbar.classList.add('wblock-tc-toolbar-hidden');
             } else {
                 showToolbar();
                 if (!video.paused && !video.ended) { scheduleHideToolbar(); }
@@ -3952,6 +4419,7 @@
             // Start hidden on desktop — it appears with native controls
             toolbar.style.opacity = '0';
             toolbar.style.setProperty('pointer-events', 'none', 'important');
+            toolbar.classList.add('wblock-tc-toolbar-hidden');
 
             var toolbarTimer = null;
             var TOOLBAR_HIDE_DELAY = 3000;
@@ -3959,7 +4427,7 @@
             var _isOverToolbar = false;
 
             function desktopPanelOpen() {
-                var panels = [qualityMenu];
+                var panels = [qualityMenu, sponsorMenu];
                 return panels.some(function (p) {
                     return p && p.style.display !== 'none' && p.style.display !== '';
                 });
@@ -3978,6 +4446,7 @@
                 if (toolbarSuppressed()) return;
                 toolbar.style.opacity = '1';
                 toolbar.style.setProperty('pointer-events', 'auto', 'important');
+                toolbar.classList.remove('wblock-tc-toolbar-hidden');
                 clearTimeout(toolbarTimer);
             }
 
@@ -3988,6 +4457,7 @@
                 }
                 toolbar.style.opacity = '0';
                 toolbar.style.setProperty('pointer-events', 'none', 'important');
+                toolbar.classList.add('wblock-tc-toolbar-hidden');
             }
 
             function scheduleHideToolbar() {
@@ -4157,34 +4627,133 @@
         return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
     }
 
+    // Native fullscreen state as reported by the element's own events. The
+    // webkitDisplayingFullscreen and webkitPresentationMode getters can lag
+    // behind or stick after an exit, so a second F press kept asking for an
+    // exit that had already happened and never re-entered. Once an event has
+    // been observed for an element its events are authoritative.
+    function onNativeFullscreenEvent(event) {
+        var video = event.target;
+        if (!video || video.tagName !== 'VIDEO') return;
+        if (event.type === 'webkitbeginfullscreen') video._wblockNativeFullscreenState = true;
+        else if (event.type === 'webkitendfullscreen') video._wblockNativeFullscreenState = false;
+        else video._wblockNativeFullscreenState = video.webkitPresentationMode === 'fullscreen';
+    }
+
+    function videoInNativeFullscreen(video) {
+        if (typeof video._wblockNativeFullscreenState === 'boolean') return video._wblockNativeFullscreenState;
+        return video.webkitPresentationMode === 'fullscreen' || video.webkitDisplayingFullscreen === true;
+    }
+
+    function enterNativeFullscreen(video, useElementApi) {
+        if (!useElementApi && typeof video.webkitSupportsPresentationMode === 'function' &&
+            video.webkitSupportsPresentationMode('fullscreen') &&
+            typeof video.webkitSetPresentationMode === 'function') {
+            video.webkitSetPresentationMode('fullscreen');
+            return;
+        }
+        if (typeof video.webkitEnterFullscreen === 'function') video.webkitEnterFullscreen();
+    }
+
+    function exitNativeFullscreen(video, useElementApi) {
+        if (!useElementApi && typeof video.webkitSetPresentationMode === 'function' &&
+            (video.webkitPresentationMode === 'fullscreen' ||
+                typeof video.webkitSupportsPresentationMode === 'function')) {
+            video.webkitSetPresentationMode('inline');
+            return;
+        }
+        if (typeof video.webkitExitFullscreen === 'function') video.webkitExitFullscreen();
+    }
+
+    var fullscreenVerifyTimer = null;
+
     function toggleNativeFullscreen(video) {
         try {
-            if (video.webkitPresentationMode === 'fullscreen' &&
-                typeof video.webkitSetPresentationMode === 'function') {
-                video.webkitSetPresentationMode('inline');
-                return;
-            }
-            if (video.webkitDisplayingFullscreen === true &&
-                typeof video.webkitExitFullscreen === 'function') {
-                video.webkitExitFullscreen();
-                return;
-            }
-            var fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
-            if (fullscreenElement) {
+            var fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement ||
+                document.webkitCurrentFullScreenElement;
+            if (fullscreenElement && fullscreenElement !== video && !videoInNativeFullscreen(video)) {
+                // YouTube's own container fullscreen is active; leave it so the
+                // next press can enter the native player.
                 if (typeof document.exitFullscreen === 'function') { document.exitFullscreen(); }
                 else if (typeof document.webkitExitFullscreen === 'function') { document.webkitExitFullscreen(); }
                 return;
             }
-            if (typeof video.webkitSupportsPresentationMode === 'function' &&
-                video.webkitSupportsPresentationMode('fullscreen') &&
-                typeof video.webkitSetPresentationMode === 'function') {
-                video.webkitSetPresentationMode('fullscreen');
-                return;
-            }
-            if (typeof video.webkitEnterFullscreen === 'function') {
-                video.webkitEnterFullscreen();
-            }
+            var wasFullscreen = videoInNativeFullscreen(video);
+            if (wasFullscreen) exitNativeFullscreen(video, false);
+            else enterNativeFullscreen(video, false);
+            // If the preferred API silently did nothing (WebKit rejects a
+            // presentation-mode change in some transitional states), retry
+            // through the element API while the key press still counts as a
+            // user gesture.
+            if (fullscreenVerifyTimer !== null) clearTimeout(fullscreenVerifyTimer);
+            fullscreenVerifyTimer = setTimeout(function () {
+                fullscreenVerifyTimer = null;
+                if (!video.isConnected || videoInNativeFullscreen(video) !== wasFullscreen) return;
+                try {
+                    if (wasFullscreen) exitNativeFullscreen(video, true);
+                    else enterNativeFullscreen(video, true);
+                } catch (e) { /* ignore */ }
+            }, 350);
         } catch (e) { /* ignore */ }
+    }
+
+    function nativeSubtitleTracks(video) {
+        var result = [];
+        var tracks = video && video.textTracks;
+        if (!tracks) return result;
+        for (var i = 0; i < tracks.length; i++) {
+            if (tracks[i].kind === 'subtitles' || tracks[i].kind === 'captions') result.push(tracks[i]);
+        }
+        return result;
+    }
+
+    function preferredSubtitleTrack(tracks) {
+        var languages = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || 'en'];
+        for (var l = 0; l < languages.length; l++) {
+            var wanted = String(languages[l] || '').toLowerCase();
+            var base = wanted.split('-')[0];
+            for (var i = 0; i < tracks.length; i++) {
+                var language = String(tracks[i].language || '').toLowerCase();
+                if (language === wanted || language.split('-')[0] === base) return tracks[i];
+            }
+        }
+        return tracks[0];
+    }
+
+    function toggleNativeSubtitles(video) {
+        var tracks = nativeSubtitleTracks(video);
+        if (!tracks.length) return false;
+        var showing = null;
+        for (var i = 0; i < tracks.length; i++) {
+            if (tracks[i].mode === 'showing') { showing = tracks[i]; break; }
+        }
+        if (showing) {
+            video._wblockLastSubtitleTrack = showing;
+            for (var j = 0; j < tracks.length; j++) {
+                try { tracks[j].mode = 'disabled'; } catch (e) { /* ignore */ }
+            }
+            return true;
+        }
+        var last = video._wblockLastSubtitleTrack;
+        var pick = last && tracks.indexOf(last) !== -1 ? last : preferredSubtitleTrack(tracks);
+        for (var k = 0; k < tracks.length; k++) {
+            try { tracks[k].mode = tracks[k] === pick ? 'showing' : 'disabled'; } catch (e) { /* ignore */ }
+        }
+        return true;
+    }
+
+    function onCaptionHotkey(event) {
+        if (event.ctrlKey || event.metaKey || event.altKey) { return; }
+        if (event.key !== 'c' && event.key !== 'C') { return; }
+        var video = activeVideo;
+        if (!video || !video.isConnected) { return; }
+        if (isTypingTarget(event.target)) { return; }
+        // YouTube's own C shortcut turns on its DOM caption overlay, which
+        // the native player hides and which would double any Safari
+        // subtitle track. Route the key to the native tracks instead.
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (!event.repeat) { toggleNativeSubtitles(video); }
     }
 
     function onFullscreenHotkey(event) {
@@ -4200,8 +4769,98 @@
         if (!event.repeat) { toggleNativeFullscreen(video); }
     }
 
+    // ------------------------------------------------------------------
+    // Pinch-out routed to native fullscreen
+    // ------------------------------------------------------------------
+
+    // Mobile YouTube turns a two-finger spread on the player into its own
+    // container fullscreen, which with the chrome hidden just scales the
+    // inline layout and leaves the page zoomed (#631). Its handlers live on
+    // the document in the capture phase, so ours must too: registered at
+    // document-start they run first, swallow the gesture, and on release
+    // present Safari's real fullscreen player the way the F key does.
+    var pinchFullscreenRequests = 0;
+
+    function setupPinchFullscreen(player, video) {
+        if (!IS_IOS || !player) return;
+        var startDistance = 0;
+        var armed = false;
+        var active = false;
+
+        function distance(touches) {
+            var dx = touches[0].clientX - touches[1].clientX;
+            var dy = touches[0].clientY - touches[1].clientY;
+            return Math.sqrt(dx * dx + dy * dy);
+        }
+
+        function insidePlayer(event) {
+            var target = event.target;
+            return target && target.nodeType === 1 && player.contains(target);
+        }
+
+        function onTouchStart(event) {
+            if (!event.touches || event.touches.length !== 2 || !insidePlayer(event)) return;
+            active = true;
+            armed = false;
+            startDistance = distance(event.touches);
+            event.stopImmediatePropagation();
+        }
+
+        function onTouchMove(event) {
+            if (!active) return;
+            if (event.touches && event.touches.length === 2 && startDistance > 0 &&
+                distance(event.touches) > startDistance * 1.25) {
+                armed = true;
+            }
+            // Non-passive: this is what keeps Safari from zooming the page.
+            if (event.cancelable) event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+
+        function onTouchEnd(event) {
+            if (!active) return;
+            event.stopImmediatePropagation();
+            if (event.touches && event.touches.length) return;
+            active = false;
+            if (!armed) return;
+            armed = false;
+            pinchFullscreenRequests++;
+            // touchend carries user activation, which the presentation APIs need.
+            if (video.isConnected && !videoInNativeFullscreen(video)) toggleNativeFullscreen(video);
+        }
+
+        function onGesture(event) {
+            if (!insidePlayer(event)) return;
+            if (event.cancelable) event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+
+        var options = { capture: true, passive: false };
+        document.addEventListener('touchstart', onTouchStart, options);
+        document.addEventListener('touchmove', onTouchMove, options);
+        document.addEventListener('touchend', onTouchEnd, options);
+        document.addEventListener('touchcancel', onTouchEnd, options);
+        document.addEventListener('gesturestart', onGesture, options);
+        document.addEventListener('gesturechange', onGesture, options);
+        document.addEventListener('gestureend', onGesture, options);
+        registerCleanup(function () {
+            document.removeEventListener('touchstart', onTouchStart, options);
+            document.removeEventListener('touchmove', onTouchMove, options);
+            document.removeEventListener('touchend', onTouchEnd, options);
+            document.removeEventListener('touchcancel', onTouchEnd, options);
+            document.removeEventListener('gesturestart', onGesture, options);
+            document.removeEventListener('gesturechange', onGesture, options);
+            document.removeEventListener('gestureend', onGesture, options);
+        });
+    }
+
     function setupFullscreenHotkey() {
         document.addEventListener('keydown', onFullscreenHotkey, true);
+        document.addEventListener('keydown', onCaptionHotkey, true);
+        // Capture phase: these events do not bubble.
+        document.addEventListener('webkitbeginfullscreen', onNativeFullscreenEvent, true);
+        document.addEventListener('webkitendfullscreen', onNativeFullscreenEvent, true);
+        document.addEventListener('webkitpresentationmodechanged', onNativeFullscreenEvent, true);
     }
 
     // ------------------------------------------------------------------
@@ -4267,9 +4926,13 @@
     }
 
     function boot() {
+        enableBackgroundPlayback();
+        if (IS_YOUTUBE_MUSIC) {
+            setupYouTubeMusic();
+            return;
+        }
         observeDocumentForPlayer();
         injectStyles();
-        enableBackgroundPlayback();
         lastUrl = location.href;
         watchNavigation();
         setupFullscreenHotkey();
@@ -4295,7 +4958,27 @@
             setPreferredQuality: setPreferredQuality,
             isToolbarHidden: isToolbarHidden,
             pipCaptionPumpTicks: function () { return pipCaptionPumpTicks; },
+            pinchFullscreenRequests: function () { return pinchFullscreenRequests; },
+            // Test hook: the app supplies settings as a prepended constant, so
+            // mutate that object and re-run branding the way a fresh load would.
+            setDeArrowSetting: function (key, value) {
+                if (typeof __wblockTubeCleanerDeArrow !== 'object') return false;
+                __wblockTubeCleanerDeArrow[key] = value;
+                refreshDeArrowBranding();
+                return true;
+            },
             setToolbarHidden: setToolbarHidden,
+            music: {
+                getAudioQuality: getMusicAudioQuality,
+                applyAudioQuality: applyMusicAudioQuality,
+                state: function () { return musicState; }
+            },
+            previewSponsorNotice: function () {
+                var p = findPlayer();
+                if (!p || !activeVideo) return 'no player';
+                showSponsorBlockNotice(p, activeVideo, { category: 'sponsor', segment: [0, 5], UUID: 'preview' }, {}, 'undo');
+                return 'ok';
+            },
             QUALITY_LABELS: QUALITY_LABELS,
             getPlayer: findPlayer,
             getChapters: extractChapters,

@@ -55,6 +55,8 @@ const userscript = readFileSync(SCRIPT_PATH, 'utf8');
 const playerUserscript = readFileSync(PLAYER_SCRIPT_PATH, 'utf8');
 const injectorSource = readFileSync(INJECTOR_PATH, 'utf8');
 const filter = (process.argv.find(a => a.startsWith('--filter=')) || '').split('=')[1] || '';
+// Thumbnail URLs the current scenario requested from dearrow-thumb.ajay.app.
+let page_thumbnailRequests = [];
 
 const iosStuckPreferencesPrelude = `
 try {
@@ -83,6 +85,14 @@ Object.defineProperty(Document.prototype, 'hidden', {
   get: function () { return window.__wblockNativeHidden; }
 });
 Object.defineProperty(Document.prototype, 'visibilityState', {
+  configurable: true,
+  get: function () { return window.__wblockNativeVisibility; }
+});
+Object.defineProperty(Document.prototype, 'webkitHidden', {
+  configurable: true,
+  get: function () { return window.__wblockNativeHidden; }
+});
+Object.defineProperty(Document.prototype, 'webkitVisibilityState', {
   configurable: true,
   get: function () { return window.__wblockNativeVisibility; }
 });
@@ -126,7 +136,8 @@ const sponsorBlockPrelude = `
           { UUID: 'test-sponsor', category: 'sponsor', actionType: 'skip', segment: [10, 20] },
           { UUID: 'test-selfpromo', category: 'selfpromo', actionType: 'skip', segment: [30, 40] },
           { UUID: 'test-interaction', category: 'interaction', actionType: 'skip', segment: [50, 60] },
-          { UUID: 'test-timer', category: 'sponsor', actionType: 'skip', segment: [70, 80] }
+          { UUID: 'test-timer', category: 'sponsor', actionType: 'skip', segment: [70, 80] },
+          { UUID: 'test-end', category: 'sponsor', actionType: 'skip', segment: [290, 300] }
         ]
       }]); }});
     }
@@ -135,12 +146,12 @@ const sponsorBlockPrelude = `
 })();
 `;
 
+// The app prepends this constant to the script. The prelude runs in the
+// injector's closure, so checks reach it through the debug hook.
 const deArrowPrelude = `
+const __wblockTubeCleanerDeArrow = { enabled: true, replaceTitles: true, replaceThumbnails: true,
+  randomThumbnails: false, showOriginalOnHover: true };
 (function () {
-  localStorage.setItem('wblock.tubeCleaner.deArrow', JSON.stringify({
-    enabled: true, replaceTitles: true, replaceThumbnails: true,
-    showOriginalOnHover: true, excludedChannels: []
-  }));
   var nativeFetch = window.fetch;
   window.__wblockDeArrowRequests = [];
   window.fetch = function (url, options) {
@@ -322,11 +333,27 @@ async function runScenario(name, { device, fixture, ua, hasTouch, viewport, scri
   if (hasTouch) ctxOpts.hasTouch = true;
   if (viewport) ctxOpts.viewport = viewport;
   const context = await browser.newContext(ctxOpts);
-  await context.route('https://dearrow-thumb.ajay.app/**', route => route.fulfill({
-    status: 200,
-    contentType: 'image/svg+xml',
-    body: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="9"><rect width="16" height="9" fill="#345"/></svg>',
-  }));
+  // The thumbnail server reports the frame time it actually served in
+  // X-Timestamp. CARDVID1234 at 12.5 answers with 14 so the script's
+  // mandatory re-request at the served time is exercised.
+  const thumbnailRequests = [];
+  await context.route('https://dearrow-thumb.ajay.app/**', route => {
+    const url = new URL(route.request().url());
+    thumbnailRequests.push(url.href);
+    const requested = Number(url.searchParams.get('time'));
+    const served = url.searchParams.get('videoID') === 'CARDVID1234' && requested === 12.5 ? 14 : requested;
+    return route.fulfill({
+      status: 200,
+      contentType: 'image/svg+xml',
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Expose-Headers': 'X-Timestamp, X-Title, X-Failure-Reason',
+        'X-Timestamp': String(served),
+      },
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="9"><rect width="16" height="9" fill="#345"/></svg>',
+    });
+  });
+  page_thumbnailRequests = thumbnailRequests;
   if (gotoURL && responseBody != null) {
     const origin = new URL(gotoURL).origin + '/**';
     await context.route(origin, route => route.fulfill({
@@ -460,6 +487,83 @@ async function commonChecks(page, scenario, { expectToolbar = true } = {}) {
     };
   });
 
+  // A second press must leave native fullscreen even when the element's
+  // getters lag, and a third must re-enter once the exit event has fired.
+  await check(page, scenario, 'F toggles native fullscreen out and back in using element events', () => {
+    const video = document.querySelector('#movie_player video');
+    if (!video) return { pass: false, detail: 'no video' };
+    const modes = [];
+    let mode = 'inline';
+    video.webkitSupportsPresentationMode = () => true;
+    video.webkitSetPresentationMode = (m) => { modes.push(m); };
+    Object.defineProperty(video, 'webkitPresentationMode', { configurable: true, get: () => mode });
+    const press = () => document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', bubbles: true, cancelable: true, composed: true }));
+    mode = 'fullscreen';
+    video.dispatchEvent(new Event('webkitpresentationmodechanged'));
+    press();
+    // Getter sticks at 'fullscreen' after the exit event: events win.
+    video.dispatchEvent(new Event('webkitendfullscreen'));
+    press();
+    delete video.webkitSupportsPresentationMode;
+    delete video.webkitSetPresentationMode;
+    delete video.webkitPresentationMode;
+    delete video._wblockNativeFullscreenState;
+    return { pass: modes.join(',') === 'inline,fullscreen', detail: 'modes=' + modes.join(',') };
+  });
+
+  await check(page, scenario, 'C toggles the native subtitle track instead of YouTube captions', () => {
+    const video = document.querySelector('#movie_player video');
+    if (!video) return { pass: false, detail: 'no video' };
+    const tracks = Array.from(video.textTracks).filter(t => t.kind === 'subtitles');
+    if (!tracks.length) return { pass: true, detail: 'skipped: scenario installs no subtitle tracks' };
+    tracks.forEach(t => { t.mode = 'disabled'; });
+    const press = () => {
+      const event = new KeyboardEvent('keydown', { key: 'c', bubbles: true, cancelable: true, composed: true });
+      document.body.dispatchEvent(event);
+      return event.defaultPrevented;
+    };
+    const prevented = press();
+    const showingOn = tracks.filter(t => t.mode === 'showing').length;
+    press();
+    const showingOff = tracks.filter(t => t.mode === 'showing').length;
+    return { pass: prevented && showingOn === 1 && showingOff === 0,
+      detail: `prevented=${prevented} on=${showingOn} off=${showingOff}` };
+  });
+
+  await check(page, scenario, 'hides the YouTube caption overlay under the native player', () => {
+    const player = document.querySelector('#movie_player');
+    if (!player) return { pass: false, detail: 'no player' };
+    const overlay = document.createElement('div');
+    overlay.className = 'ytp-caption-window-container';
+    player.appendChild(overlay);
+    const display = getComputedStyle(overlay).display;
+    overlay.remove();
+    return { pass: display === 'none', detail: `display=${display}` };
+  });
+
+  await page.evaluate(() => {
+    const video = document.querySelector('#movie_player video');
+    const tracks = Array.from(video.textTracks).filter(t => t.kind === 'subtitles');
+    tracks.forEach(t => { t.mode = 'disabled'; });
+    window.__wblockTrackCount = tracks.length;
+    if (tracks.length > 1) { tracks[0].mode = 'showing'; }
+  });
+  await page.waitForTimeout(50);
+  await page.evaluate(() => {
+    const video = document.querySelector('#movie_player video');
+    const tracks = Array.from(video.textTracks).filter(t => t.kind === 'subtitles');
+    if (tracks.length > 1) { tracks[1].mode = 'showing'; }
+  });
+  await page.waitForTimeout(100);
+  await check(page, scenario, 'keeps only the most recently enabled native subtitle track showing', () => {
+    const video = document.querySelector('#movie_player video');
+    const tracks = Array.from(video.textTracks).filter(t => t.kind === 'subtitles');
+    if (tracks.length < 2) return { pass: true, detail: `skipped: tracks=${tracks.length}` };
+    const showing = tracks.map(t => t.mode);
+    tracks.forEach(t => { t.mode = 'disabled'; });
+    return { pass: showing[0] === 'disabled' && showing[1] === 'showing', detail: `modes=${showing.join(',')}` };
+  });
+
   await check(page, scenario, 'keeps unknown YouTube overlays behind the native video', () => {
     const player = document.querySelector('.wblock-tc-native');
     const video = player?.querySelector('video');
@@ -510,10 +614,10 @@ async function commonChecks(page, scenario, { expectToolbar = true } = {}) {
       const quality = playback?.querySelector('.wblock-tc-quality-button');
       const audio = playback?.querySelector('.wblock-tc-audio-button');
       const sponsor = services?.querySelector('.wblock-tc-sponsor-button');
-      const deArrow = services?.querySelector('.wblock-tc-dearrow-button');
-      return { pass: !!(quality && audio && sponsor && deArrow) && !playback.querySelector('.wblock-tc-sponsor-button') &&
-          !playback.querySelector('.wblock-tc-dearrow-button'),
-        detail: `quality=${!!quality} audio=${!!audio} sponsor=${!!sponsor} deArrow=${!!deArrow}` };
+      const deArrow = tb?.querySelector('.wblock-tc-dearrow-button');
+      const servicesFirst = !!(playback && services) && !!(services.compareDocumentPosition(playback) & Node.DOCUMENT_POSITION_FOLLOWING);
+      return { pass: !!(quality && audio && sponsor) && !deArrow && !playback.querySelector('.wblock-tc-sponsor-button') && servicesFirst,
+        detail: `quality=${!!quality} audio=${!!audio} sponsor=${!!sponsor} deArrow=${!!deArrow} servicesFirst=${servicesFirst}` };
     });
   } else {
     await check(page, scenario, 'adds separate quality and service rows beside Safari native controls on iOS', () => {
@@ -522,12 +626,13 @@ async function commonChecks(page, scenario, { expectToolbar = true } = {}) {
       const services = toolbar?.querySelector('.wblock-tc-services-row');
       const quality = playback?.querySelector('.wblock-tc-quality-button');
       const sponsor = services?.querySelector('.wblock-tc-sponsor-button');
-      const deArrow = services?.querySelector('.wblock-tc-dearrow-button');
+      const deArrow = toolbar?.querySelector('.wblock-tc-dearrow-button');
       const audio = toolbar?.querySelector('.wblock-tc-audio-button');
+      const qualityBelowSB = !!(quality && sponsor) && quality.getBoundingClientRect().top > sponsor.getBoundingClientRect().bottom - 1;
       return {
-        pass: !!toolbar && !!quality && !!sponsor && !!deArrow && !audio &&
+        pass: !!toolbar && !!quality && !!sponsor && !deArrow && !audio && qualityBelowSB &&
           getComputedStyle(toolbar).pointerEvents === 'auto',
-        detail: `toolbar=${!!toolbar} quality=${!!quality} sponsor=${!!sponsor} deArrow=${!!deArrow} audio=${!!audio}`,
+        detail: `toolbar=${!!toolbar} quality=${!!quality} sponsor=${!!sponsor} deArrow=${!!deArrow} audio=${!!audio} qualityBelowSB=${qualityBelowSB}`,
       };
     });
     await page.evaluate(() => document.querySelector('.wblock-tc-sponsor-button').click());
@@ -542,18 +647,6 @@ async function commonChecks(page, scenario, { expectToolbar = true } = {}) {
         detail: rect ? `${Math.round(rect.left)},${Math.round(rect.top)} ${Math.round(rect.width)}x${Math.round(rect.height)} content=${panel.scrollHeight}/${panel.clientHeight} scroll=${panel.scrollTop}/${maxScroll} pageOverlay=${pageOverlay}` : 'no panel' };
     });
     await page.evaluate(() => document.querySelector('.wblock-tc-sponsor-button').click());
-    await page.evaluate(() => document.querySelector('.wblock-tc-dearrow-button').click());
-    await check(page, scenario, 'keeps the opt-in DeArrow settings panel inside the iOS viewport', () => {
-      const panel = document.querySelector('.wblock-tc-dearrow-menu');
-      const rect = panel?.getBoundingClientRect();
-      const enabled = panel?.querySelector('[data-dearrow-setting="enabled"]');
-      const button = document.querySelector('.wblock-tc-dearrow-button');
-      const pageOverlay = panel?.parentElement === document.body;
-      return { pass: !!rect && rect.left >= 0 && rect.right <= innerWidth && rect.top >= 0 && rect.bottom <= innerHeight && pageOverlay &&
-          enabled?.checked === false && button?.getAttribute('aria-pressed') === 'false',
-        detail: rect ? `${Math.round(rect.left)},${Math.round(rect.top)} ${Math.round(rect.width)}x${Math.round(rect.height)} enabled=${enabled?.checked} pageOverlay=${pageOverlay}` : 'no panel' };
-    });
-    await page.evaluate(() => document.querySelector('.wblock-tc-dearrow-button').click());
   }
 
   await check(page, scenario, 'overrides document.hidden (background playback)', () => {
@@ -788,6 +881,49 @@ async function iosAutoHideCheck(page, scenario) {
 // ladder so a tap can request a higher rendition on demand, and choosing one
 // must not be silently downgraded back to 360p. Regression guard for the
 // "only 360p shown on iOS, video is actually 1440p" report.
+// #631: a two-finger spread on the player must be swallowed before YouTube's
+// document-level capture handlers see it and must ask for native fullscreen on
+// release, while a plain two-finger tap (no spread) asks for nothing.
+async function iosPinchFullscreenCheck(page, scenario) {
+  await check(page, scenario, 'pinch-out on the player is routed to native fullscreen', () => {
+    const player = document.querySelector('#movie_player');
+    const video = player && player.querySelector('video');
+    const d = window.__wblockTubeDebug;
+    if (!player || !video || !d || typeof d.pinchFullscreenRequests !== 'function') {
+      return { pass: false, detail: 'missing player, video, or debug hook' };
+    }
+    let leaked = 0;
+    const spy = (event) => { if (event.touches && event.touches.length === 2) leaked++; };
+    document.body.addEventListener('touchstart', spy, true);
+    document.body.addEventListener('touchmove', spy, true);
+    // WebKit has no Touch constructor; use its legacy createTouch factory.
+    if (typeof document.createTouch !== 'function' || typeof document.createTouchList !== 'function') {
+      return { pass: false, detail: 'no document.createTouch in this WebKit' };
+    }
+    const touch = (id, x, y) => document.createTouch(window, video, id, x, y, x, y);
+    const fire = (type, touches) => {
+      const list = document.createTouchList(...touches);
+      const event = new TouchEvent(type, { bubbles: true, cancelable: true, composed: true });
+      for (const key of ['touches', 'targetTouches', 'changedTouches']) {
+        Object.defineProperty(event, key, { value: list });
+      }
+      video.dispatchEvent(event);
+    };
+    const before = d.pinchFullscreenRequests();
+    fire('touchstart', [touch(1, 100, 100), touch(2, 120, 100)]);
+    fire('touchmove', [touch(1, 60, 100), touch(2, 160, 100)]);
+    fire('touchend', []);
+    const afterSpread = d.pinchFullscreenRequests();
+    fire('touchstart', [touch(1, 100, 100), touch(2, 120, 100)]);
+    fire('touchend', []);
+    const afterTap = d.pinchFullscreenRequests();
+    document.body.removeEventListener('touchstart', spy, true);
+    document.body.removeEventListener('touchmove', spy, true);
+    const pass = afterSpread === before + 1 && afterTap === afterSpread && leaked === 0;
+    return { pass, detail: `spread=${afterSpread - before}, tap=${afterTap - afterSpread}, leakedToPage=${leaked}` };
+  });
+}
+
 async function iosQualityLadderCheck(page, scenario) {
   await page.evaluate(() => {
     const player = document.getElementById('movie_player');
@@ -1100,16 +1236,22 @@ async function qualityUISelectionCheck(page, scenario) {
     const watchTitle = document.querySelector('#watch-metadata h1 yt-formatted-string')?.textContent;
     const cardTitle = document.querySelector('ytd-compact-video-renderer #video-title')?.textContent;
     const thumbnail = document.querySelector('ytd-compact-video-renderer img')?.getAttribute('src') || '';
+    const requested = document.querySelector('ytd-compact-video-renderer img')?.getAttribute('data-wblock-dearrow-thumbnail') || '';
     const requests = window.__wblockDeArrowRequests || [];
     const hashRequest = requests.find(value => /api\/branding\/[a-f0-9]{4}/.test(value));
     const cardRequest = requests.find(value => value.includes('videoID=CARDVID1234'));
     return {
       pass: watchTitle === 'Accurate Watch Title' && cardTitle === 'Accurate Related Title' &&
-        thumbnail.includes('dearrow-thumb.ajay.app/api/v1/getThumbnail') && thumbnail.includes('time=12.5') &&
-        !!hashRequest && !hashRequest.includes('dQw4w9WgXcQ') && !!cardRequest,
-      detail: `watch=${watchTitle} card=${cardTitle} requests=${requests.length} thumbnail=${thumbnail}`,
+        thumbnail.startsWith('blob:') && requested.includes('dearrow-thumb.ajay.app/api/v1/getThumbnail') &&
+        requested.includes('time=14') && !!hashRequest && !hashRequest.includes('dQw4w9WgXcQ') && !!cardRequest,
+      detail: `watch=${watchTitle} card=${cardTitle} requests=${requests.length} thumbnail=${thumbnail} requested=${requested}`,
     };
   });
+  record('desktop', 're-requests a DeArrow thumbnail at the served X-Timestamp when it differs',
+    page_thumbnailRequests.some(u => u.includes('videoID=CARDVID1234') && u.includes('time=12.5')) &&
+    page_thumbnailRequests.some(u => u.includes('videoID=CARDVID1234') && u.includes('time=14')) &&
+    page_thumbnailRequests.filter(u => u.includes('videoID=CARDVID1234')).length === 2,
+    `thumbnailRequests=${page_thumbnailRequests.filter(u => u.includes('CARDVID1234')).join(' ')}`);
   await page.evaluate(() => document.querySelector('ytd-compact-video-renderer').dispatchEvent(new MouseEvent('mouseenter')));
   await check(page, 'desktop', 'shows original DeArrow card branding on hover', () => {
     const title = document.querySelector('ytd-compact-video-renderer #video-title')?.textContent;
@@ -1121,28 +1263,22 @@ async function qualityUISelectionCheck(page, scenario) {
   await check(page, 'desktop', 'restores custom DeArrow card branding after hover', () => {
     const title = document.querySelector('ytd-compact-video-renderer #video-title')?.textContent;
     const thumbnail = document.querySelector('ytd-compact-video-renderer img')?.getAttribute('src') || '';
-    return { pass: title === 'Accurate Related Title' && thumbnail.includes('dearrow-thumb.ajay.app'),
+    return { pass: title === 'Accurate Related Title' && thumbnail.startsWith('blob:'),
       detail: `title=${title} thumbnail=${thumbnail}` };
   });
   await page.evaluate(() => {
-    document.querySelector('.wblock-tc-dearrow-button').click();
-    const titles = document.querySelector('[data-dearrow-setting="replaceTitles"]');
-    titles.checked = false;
-    titles.dispatchEvent(new Event('change', { bubbles: true }));
+    window.__wblockTubeDebug.setDeArrowSetting('replaceTitles', false);
   });
-  await check(page, 'desktop', 'persists and immediately applies independent DeArrow title settings', () => {
-    const settings = JSON.parse(localStorage.getItem('wblock.tubeCleaner.deArrow') || '{}');
+  await check(page, 'desktop', 'applies independent DeArrow title settings from the app-injected constant', () => {
     const watchTitle = document.querySelector('#watch-metadata h1 yt-formatted-string')?.textContent;
     const cardTitle = document.querySelector('ytd-compact-video-renderer #video-title')?.textContent;
     const thumbnail = document.querySelector('ytd-compact-video-renderer img')?.getAttribute('src') || '';
-    return { pass: settings.replaceTitles === false && watchTitle === 'Original Watch Title' &&
-        cardTitle === 'Original Related Title' && thumbnail.includes('dearrow-thumb.ajay.app'),
-      detail: `replaceTitles=${settings.replaceTitles} watch=${watchTitle} card=${cardTitle}` };
+    return { pass: watchTitle === 'Original Watch Title' &&
+        cardTitle === 'Original Related Title' && thumbnail.startsWith('blob:'),
+      detail: `watch=${watchTitle} card=${cardTitle}` };
   });
   await page.evaluate(() => {
-    const titles = document.querySelector('[data-dearrow-setting="replaceTitles"]');
-    titles.checked = true;
-    titles.dispatchEvent(new Event('change', { bubbles: true }));
+    window.__wblockTubeDebug.setDeArrowSetting('replaceTitles', true);
   });
   await check(page, 'desktop', 'reapplies DeArrow titles from its bounded session cache', () => {
     const requests = window.__wblockDeArrowRequests || [];
@@ -1150,26 +1286,6 @@ async function qualityUISelectionCheck(page, scenario) {
     const cardTitle = document.querySelector('ytd-compact-video-renderer #video-title')?.textContent;
     return { pass: requests.length === 2 && watchTitle === 'Accurate Watch Title' && cardTitle === 'Accurate Related Title',
       detail: `requests=${requests.length} watch=${watchTitle} card=${cardTitle}` };
-  });
-  await page.evaluate(() => {
-    const channel = document.querySelector('[data-dearrow-setting="channel"]');
-    channel.checked = true;
-    channel.dispatchEvent(new Event('change', { bubbles: true }));
-  });
-  await check(page, 'desktop', 'supports per-channel DeArrow exclusions without affecting other channels', () => {
-    const settings = JSON.parse(localStorage.getItem('wblock.tubeCleaner.deArrow') || '{}');
-    const watchTitle = document.querySelector('#watch-metadata h1 yt-formatted-string')?.textContent;
-    const cardTitle = document.querySelector('ytd-compact-video-renderer #video-title')?.textContent;
-    const button = document.querySelector('.wblock-tc-dearrow-button');
-    return { pass: settings.excludedChannels?.includes('test-channel') && watchTitle === 'Original Watch Title' &&
-        cardTitle === 'Accurate Related Title' && button?.getAttribute('aria-pressed') === 'false',
-      detail: `channels=${settings.excludedChannels?.join(',')} watch=${watchTitle} card=${cardTitle}` };
-  });
-  await page.evaluate(() => {
-    const channel = document.querySelector('[data-dearrow-setting="channel"]');
-    channel.checked = false;
-    channel.dispatchEvent(new Event('change', { bubbles: true }));
-    document.querySelector('.wblock-tc-dearrow-button').click();
   });
   await page.waitForFunction(() => document.querySelector('#watch-metadata h1 yt-formatted-string')?.textContent === 'Accurate Watch Title');
   await page.waitForFunction(() => !!window.__wblockSponsorRequest);
@@ -1220,6 +1336,21 @@ async function qualityUISelectionCheck(page, scenario) {
     detail: `time=${window.__wblockSeekingSponsorTime}`,
   }));
   await page.evaluate(() => {
+    const video = document.querySelector('#movie_player video');
+    Object.defineProperty(video, 'duration', { configurable: true, get: () => 300 });
+    video.currentTime = 291;
+    video.dispatchEvent(new Event('timeupdate'));
+    window.__wblockEndSkipTime = video.currentTime;
+    delete video.duration;
+  });
+  // Seeking a WebKit media element to exactly its duration replays the video
+  // instead of firing ended, which is what Safari users saw as "restarts at
+  // the end" whenever an outro segment ran to the last frame.
+  await check(page, 'desktop', 'stops a SponsorBlock skip just short of the duration instead of seeking to the end', () => ({
+    pass: window.__wblockEndSkipTime > 299.9 && window.__wblockEndSkipTime < 300,
+    detail: `time=${window.__wblockEndSkipTime}`,
+  }));
+  await page.evaluate(() => {
     history.replaceState(null, '', location.pathname + '?v=dQw4w9WgXcQ&cache-check=1');
     document.dispatchEvent(new Event('yt-navigate-finish'));
   });
@@ -1229,23 +1360,18 @@ async function qualityUISelectionCheck(page, scenario) {
     detail: `sponsorRequests=${window.__wblockSponsorRequestCount} deArrowRequests=${window.__wblockDeArrowRequests.length}`,
   }));
   await page.evaluate(() => {
-    document.querySelector('.wblock-tc-dearrow-button').click();
-    const random = document.querySelector('[data-dearrow-setting="randomThumbnails"]');
-    random.checked = true;
-    random.dispatchEvent(new Event('change', { bubbles: true }));
+    window.__wblockTubeDebug.setDeArrowSetting('randomThumbnails', true);
     const card = document.createElement('ytd-compact-video-renderer');
     card.setAttribute('data-video-id', 'RANDOMVID01');
     card.setAttribute('data-channel-id', 'other-channel');
     card.innerHTML = '<a id="thumbnail" href="/watch?v=RANDOMVID01"><img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="></a><a id="video-title" href="/watch?v=RANDOMVID01">Original random video</a>';
     document.getElementById('recommendations').appendChild(card);
   });
-  await page.waitForFunction(() => document.querySelector('[data-video-id="RANDOMVID01"] img')?.getAttribute('src')?.includes('dearrow-thumb.ajay.app/api/v1/getThumbnail'));
+  await page.waitForFunction(() => document.querySelector('[data-video-id="RANDOMVID01"] img')?.getAttribute('src')?.startsWith('blob:'));
   await check(page, 'desktop', 'uses DeArrow random-time fallback when a video has no submitted thumbnail', () => {
-    const settings = JSON.parse(localStorage.getItem('wblock.tubeCleaner.deArrow') || '{}');
     const image = document.querySelector('[data-video-id="RANDOMVID01"] img');
-    const thumbnail = image?.getAttribute('src') || '';
-    return { pass: settings.randomThumbnails === true && thumbnail.includes('time=30'),
-      detail: `enabled=${settings.randomThumbnails} thumbnail=${thumbnail}` };
+    const requested = image?.getAttribute('data-wblock-dearrow-thumbnail') || '';
+    return { pass: requested.includes('dearrow-thumb.ajay.app/api/v1/getThumbnail') && requested.includes('time=30'), detail: `requested=${requested}` };
   });
   await page.evaluate(() => {
     document.querySelector('.wblock-tc-sponsor-button').click();
@@ -1262,6 +1388,11 @@ async function qualityUISelectionCheck(page, scenario) {
     return { pass: panel?.style.display === 'block' && settings.modes?.selfpromo === 'auto' &&
         settings.modes?.interaction === 'ask',
       detail: `panel=${panel?.style.display} selfpromo=${settings.modes?.selfpromo} interaction=${settings.modes?.interaction}` };
+  });
+  await check(page, 'desktop', 'credits SponsorBlock and links its donate page from the panel footer', () => {
+    const links = [...document.querySelectorAll('.wblock-tc-sponsor-menu a')].map(a => a.href + '|' + a.textContent);
+    return { pass: links.includes('https://sponsor.ajay.app/|Using SponsorBlock') && links.includes('https://sponsor.ajay.app/donate/|Donate'),
+      detail: links.join(' ') };
   });
   await page.evaluate(() => {
     const video = document.querySelector('#movie_player video');
@@ -1488,6 +1619,16 @@ async function qualityUISelectionCheck(page, scenario) {
     const o = document.querySelector('.wblock-tc-toolbar')?.style.opacity;
     return { pass: o === '0', detail: `opacity=${o}` };
   });
+  // pointer-events does not cascade: a hidden toolbar whose buttons still
+  // accept hits swallows taps meant for the video underneath.
+  await check(page, 'desktop', 'hidden toolbar buttons do not intercept pointer events', () => {
+    const toolbar = document.querySelector('.wblock-tc-toolbar');
+    const buttons = toolbar ? Array.from(toolbar.querySelectorAll('button')) : [];
+    if (!buttons.length) return { pass: false, detail: 'no toolbar buttons' };
+    const live = buttons.filter(b => getComputedStyle(b).pointerEvents !== 'none');
+    const cls = toolbar.classList.contains('wblock-tc-toolbar-hidden');
+    return { pass: cls && live.length === 0, detail: `hiddenClass=${cls} liveButtons=${live.length}/${buttons.length}` };
+  });
   record('desktop', 'no uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   await browser.close();
 }
@@ -1698,7 +1839,67 @@ async function qualityUISelectionCheck(page, scenario) {
   await iosQualityLadderCheck(page, 'iPhone');
   await iosLandscapeCheck(page, 'iPhone');
   await iosAutoHideCheck(page, 'iPhone');
+  await iosPinchFullscreenCheck(page, 'iPhone');
   await controlsSurvivalCheck(page, 'iPhone', { preserveIOSMMSRestrictions: true });
+  // Safari shares one storage quota per origin. When youtube.com is full the
+  // hide preference must still stick for this page, and the next write must
+  // make room by dropping Tube Cleaner's oldest resume positions.
+  await page.evaluate(() => {
+    localStorage.removeItem('wblock.tubeCleaner.hideToolbar');
+    for (let i = 0; i < 60; i++) {
+      localStorage.setItem('wblock.tubeCleaner.position.QUOTA' + String(i).padStart(6, '0'), JSON.stringify({ time: 10 + i, updatedAt: 1000 + i }));
+    }
+    const nativeSet = Storage.prototype.setItem;
+    window.__wblockQuotaFailures = 0;
+    Storage.prototype.setItem = function (key, value) {
+      if (window.__wblockQuotaFailures === 0 && key === 'wblock.tubeCleaner.hideToolbar') {
+        window.__wblockQuotaFailures++;
+        throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+      }
+      return nativeSet.call(this, key, value);
+    };
+  });
+  await page.evaluate(() => document.querySelector('.wblock-tc-sponsor-button').click());
+  await page.waitForTimeout(100);
+  const hideRow = (await page.$$('.wblock-tc-sponsor-menu label')).at(-3);
+  await (await hideRow.$('input')).tap();
+  await page.waitForTimeout(150);
+  await check(page, 'iPhone', 'keeps the hide-controls preference when the first localStorage write hits the quota', () => {
+    const stored = localStorage.getItem('wblock.tubeCleaner.hideToolbar');
+    const positions = Object.keys(localStorage).filter(k => k.startsWith('wblock.tubeCleaner.position.QUOTA')).length;
+    const newest = localStorage.getItem('wblock.tubeCleaner.position.QUOTA000059');
+    const oldest = localStorage.getItem('wblock.tubeCleaner.position.QUOTA000000');
+    return { pass: stored === '1' && window.__wblockQuotaFailures === 1 && positions === 40 && !!newest && !oldest,
+      detail: `stored=${stored} failures=${window.__wblockQuotaFailures} positions=${positions} newestKept=${!!newest} oldestDropped=${!oldest}` };
+  });
+  await page.evaluate(() => { document.querySelector('.wblock-tc-sponsor-button').click(); });
+  await page.reload();
+  await page.waitForSelector('.wblock-tc-toolbar', { timeout: 5000 });
+  await check(page, 'iPhone', 'starts hidden on the next load after the hide preference was saved', () => {
+    const toolbar = document.querySelector('.wblock-tc-toolbar');
+    return { pass: toolbar.classList.contains('wblock-tc-toolbar-hidden') && toolbar.style.opacity === '0', detail: `hidden=${toolbar.classList.contains('wblock-tc-toolbar-hidden')} opacity=${toolbar.style.opacity}` };
+  });
+  await page.evaluate(() => localStorage.removeItem('wblock.tubeCleaner.hideToolbar'));
+  await page.evaluate(() => {
+    const player = document.getElementById('movie_player');
+    const video = player.querySelector('video');
+    player.getVideoData = () => ({ video_id: 'TESTVID123', title: 'iPhone Now Playing', author: 'Test Channel' });
+    Object.defineProperty(video, 'paused', { configurable: true, get: () => false });
+    Object.defineProperty(video, 'ended', { configurable: true, get: () => false });
+    Object.defineProperty(video, 'webkitPresentationMode', { configurable: true, writable: true, value: 'inline' });
+    video.webkitSupportsPresentationMode = mode => mode === 'picture-in-picture';
+    video.webkitSetPresentationMode = function (mode) { this.webkitPresentationMode = mode; };
+    video.dispatchEvent(new Event('play'));
+    window.dispatchEvent(new Event('blur'));
+  });
+  await check(page, 'iPhone', 'enters PiP before iPhone can suspend a backgrounded video', () => {
+    const video = document.querySelector('#movie_player video');
+    return { pass: video.webkitPresentationMode === 'picture-in-picture', detail: `pip=${video.webkitPresentationMode}` };
+  });
+  await check(page, 'iPhone', 'supplies the video title used by Safari native media UI', () => {
+    const video = document.querySelector('#movie_player video');
+    return { pass: video.getAttribute('title') === 'iPhone Now Playing', detail: `title=${video.getAttribute('title')}` };
+  });
   record('iPhone', 'no uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   await browser.close();
 }
@@ -1949,6 +2150,30 @@ async function qualityUISelectionCheck(page, scenario) {
     pass: window.__wblockMediaElementLifecycleIntact === true,
     detail: `lifecycle=${window.__wblockMediaElementLifecycleIntact}`,
   }));
+
+  await check(page, 'player-cleaner', 'nativeizes THEOplayer video and preserves its shell', () => {
+    const v = document.querySelector('#theoplayer video');
+    const ads = document.querySelector('#theoplayer .theo-ad-container');
+    const chrome = document.querySelector('#theoplayer .theoplayer-controls');
+    const pe = v && getComputedStyle(v).pointerEvents;
+    return { pass: !!(v && v.controls && v.hasAttribute('data-wblock-player-cleaner') && ads && chrome
+      && chrome.style.display === 'none' && window.__wblockTheoLifecycleIntact === true && pe === 'auto'),
+      detail: `video=${!!v} controls=${v && v.controls} ads=${!!ads} chrome=${chrome && chrome.style.display} lifecycle=${window.__wblockTheoLifecycleIntact} pointerEvents=${pe}` };
+  });
+
+  // THEOplayer pauses from mousedown on its shell; a native-control tap on
+  // the video still emits that, so the guard has to stop the mouse pair too.
+  await check(page, 'player-cleaner', 'keeps mousedown/mouseup from reaching the THEOplayer shell', () => {
+    const shell = document.querySelector('#theoplayer');
+    const v = shell && shell.querySelector('video');
+    if (!shell || !v) return { pass: false, detail: 'missing shell or video' };
+    const leaked = [];
+    const record = (e) => leaked.push(e.type);
+    ['mousedown', 'mouseup', 'click'].forEach((t) => shell.addEventListener(t, record));
+    ['mousedown', 'mouseup', 'click'].forEach((t) => v.dispatchEvent(new MouseEvent(t, { bubbles: true, composed: true })));
+    ['mousedown', 'mouseup', 'click'].forEach((t) => shell.removeEventListener(t, record));
+    return { pass: leaked.length === 0, detail: leaked.length ? `leaked=${leaked.join(',')}` : 'leaked=0' };
+  });
 
   record('player-cleaner', 'no uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   await browser.close();
@@ -3362,19 +3587,425 @@ for (const config of [
       detail: `pip=${window.__wblockPiPMode}`,
     }));
   }
-  await page.evaluate((selector) => {
-    const video = document.querySelector(selector);
-    window.__wblockPausedOnHide = false;
-    video.pause = function () { window.__wblockPausedOnHide = true; };
-    window.dispatchEvent(new Event('pagehide'));
-  }, config.selector);
-  await check(page, config.key, 'pauses the video when the tab is closing', () => ({
-    pass: window.__wblockPausedOnHide === true,
-    detail: `paused=${window.__wblockPausedOnHide}`,
-  }));
+  if (config.name === 'Tube Cleaner') {
+    await page.evaluate((selector) => {
+      const video = document.querySelector(selector);
+      window.__wblockPausedOnHide = false;
+      window.__wblockPageVisibilityHandlerRan = false;
+      video.pause = function () { window.__wblockPausedOnHide = true; };
+      document.addEventListener('visibilitychange', function pageVisibilityHandler() {
+        window.__wblockPageVisibilityHandlerRan = true;
+        video.pause();
+      }, { once: true });
+      window.__wblockNativeHidden = true;
+      window.__wblockNativeVisibility = 'hidden';
+      document.dispatchEvent(new Event('visibilitychange'));
+      window.dispatchEvent(new Event('pagehide'));
+    }, config.selector);
+    await check(page, config.key, 'keeps page pause handlers out of hidden and pagehide transitions', () => ({
+      pass: window.__wblockPausedOnHide === false && window.__wblockPageVisibilityHandlerRan === false &&
+        document.hidden === false && document.visibilityState === 'visible' &&
+        document.webkitHidden === false && document.webkitVisibilityState === 'visible',
+      detail: `paused=${window.__wblockPausedOnHide} pageHandler=${window.__wblockPageVisibilityHandlerRan} hidden=${document.hidden} webkitHidden=${document.webkitHidden}`,
+    }));
+  } else {
+    await page.evaluate((selector) => {
+      const video = document.querySelector(selector);
+      window.__wblockPausedOnHide = false;
+      video.pause = function () { window.__wblockPausedOnHide = true; };
+      window.dispatchEvent(new Event('pagehide'));
+    }, config.selector);
+    await check(page, config.key, 'pauses the video when the tab is closing', () => ({
+      pass: window.__wblockPausedOnHide === true,
+      detail: `paused=${window.__wblockPausedOnHide}`,
+    }));
+  }
   record(config.key, 'no uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
   await browser.close();
 }
+
+// ---- Scenario: YouTube Music keeps its own player -----------------------
+// YTM already supplies a complete responsive player and Media Session. Tube
+// Cleaner should retain only the document-start background-playback guard, or
+// WebKit controls create a second transport directly above YTM's controls.
+{
+  const musicFixture = `<!doctype html><html><head><meta name="viewport" content="width=device-width">
+    <style>
+      body { margin: 0; background: #030303; color: white; }
+      #movie_player { position: relative; width: 390px; height: 219px; }
+      video { width: 100%; height: 100%; }
+      #player-page { display: block; padding: 16px; }
+    </style></head><body>
+    <div id="movie_player" class="html5-video-player ytp-hide-controls">
+      <div class="html5-video-container"><video playsinline></video></div>
+    </div>
+    <ytmusic-player-page id="player-page">
+      <button id="ytmusic-play">Play</button>
+      <button id="ytmusic-settings">Settings</button>
+    </ytmusic-player-page>
+    <script>
+      const player = document.getElementById('movie_player');
+      player.getAvailableQualityLevels = () => ['hd1080', 'hd720', 'medium'];
+      player.getPlaybackQuality = () => 'medium';
+      player.setPlaybackQualityRange = () => {};
+      player.getVideoData = () => ({ video_id: 'dQw4w9WgXcQ', title: 'YTM-owned title', author: 'YTM-owned artist' });
+    <\/script></body></html>`;
+  const musicOwnedSession = `
+    // WebKit's YouTube-specific caption bridge queries this API as soon as the
+    // synthetic #movie_player appears. Real YTM supplies it on the player.
+    HTMLElement.prototype.getOption = function () { return []; };
+    HTMLElement.prototype.isSubtitlesOn = function () { return false; };
+    HTMLElement.prototype.setOption = function () {};
+    HTMLElement.prototype.loadModule = function () {};
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: 'YTM-owned title', artist: 'YTM-owned artist', album: 'YTM-owned album'
+    });
+    navigator.mediaSession.playbackState = 'playing';
+  `;
+  const { browser, page, pageErrors } = await runScenario('Tube Cleaner (YouTube Music light integration)', {
+    gotoURL: 'https://music.youtube.com/watch?v=dQw4w9WgXcQ',
+    responseBody: musicFixture,
+    readySignal: '#player-page',
+    viewport: { width: 390, height: 844 },
+    hasTouch: true,
+    scriptSource: visibilityPrelude + '\n' + mediaSessionPrelude + '\n' + musicOwnedSession + '\n' + userscript,
+  });
+  const S = 'tube-cleaner-youtube-music';
+  await page.waitForTimeout(200);
+
+  await check(page, S, 'leaves YouTube Music as the only player surface', () => {
+    const player = document.getElementById('movie_player');
+    const video = player?.querySelector('video');
+    const transport = document.getElementById('player-page');
+    return {
+      pass: !!(player && video && transport && !video.controls &&
+        !player.classList.contains('wblock-tc-native') &&
+        !player.hasAttribute('data-wblock-tc-cleaned') &&
+        !document.querySelector('.wblock-tc-toolbar') &&
+        !document.getElementById('wblock-tc-style') &&
+        getComputedStyle(transport).display !== 'none'),
+      detail: `native=${!!player?.classList.contains('wblock-tc-native')} controls=${!!video?.controls} toolbar=${!!document.querySelector('.wblock-tc-toolbar')} stock=${getComputedStyle(transport).display}`,
+    };
+  });
+
+  await check(page, S, 'preserves YouTube Music Now Playing metadata', () => {
+    const metadata = navigator.mediaSession.metadata;
+    return {
+      pass: metadata?.title === 'YTM-owned title' && metadata?.artist === 'YTM-owned artist' &&
+        metadata?.album === 'YTM-owned album' && navigator.mediaSession.playbackState === 'playing',
+      detail: `title=${metadata?.title} artist=${metadata?.artist} state=${navigator.mediaSession.playbackState}`,
+    };
+  });
+
+  await page.evaluate(() => {
+    const video = document.querySelector('#movie_player video');
+    window.__wblockMusicPauseAttempted = false;
+    video.pause = function () { window.__wblockMusicPauseAttempted = true; };
+    document.addEventListener('visibilitychange', function () { video.pause(); }, { once: true });
+    window.__wblockNativeHidden = true;
+    window.__wblockNativeVisibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.dispatchEvent(new Event('pagehide'));
+  });
+  await check(page, S, 'keeps YouTube Music playing through screen and app switches', () => ({
+    pass: window.__wblockMusicPauseAttempted === false && document.hidden === false &&
+      document.visibilityState === 'visible' && document.webkitHidden === false &&
+      document.webkitVisibilityState === 'visible',
+    detail: `paused=${window.__wblockMusicPauseAttempted} hidden=${document.hidden} webkitHidden=${document.webkitHidden}`,
+  }));
+
+  await page.screenshot({ path: join(__dirname, 'artifacts', 'tube-cleaner-youtube-music.png'), fullPage: true });
+  record(S, 'no uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
+  await browser.close();
+}
+
+// ---- Scenario: YouTube Music owns only the missing capabilities ---------
+// The fixture mirrors the live player API observed on music.youtube.com: one
+// persistent <video>, getPresentingPlayerType() 2 plus the ad-showing class
+// during an ad break, ytcfg AUDIO_QUALITY as the audio rendition selector,
+// and the Playback settings menu's MUSIC_WEB_AUDIO_QUALITY listbox.
+{
+  const musicFixture = `<!doctype html><html><head><meta name="viewport" content="width=device-width">
+    <script>
+      window.__cfg = { AUDIO_QUALITY: 'AUDIO_QUALITY_MEDIUM' };
+      window.ytcfg = { get: k => window.__cfg[k], set: function (k, v) { if (typeof k === 'object') Object.assign(window.__cfg, k); else window.__cfg[k] = v; } };
+    <\/script>
+    <style>
+      body { margin: 0; background: #030303; color: white; }
+      #movie_player { position: relative; width: 390px; height: 219px; }
+      video { width: 100%; height: 100%; }
+      ytmusic-player-bar { display: block; padding: 8px; }
+    </style></head><body>
+    <div id="movie_player" class="html5-video-player ytp-hide-controls ad-created ad-showing ad-interrupting playing-mode">
+      <div class="html5-video-container"><video playsinline></video></div>
+    </div>
+    <ytmusic-player-bar slot="player-bar" role="toolbar">
+      <div class="thumbnail-image-wrapper"><img class="image style-scope ytmusic-player-bar" src="https://yt3.googleusercontent.com/art=w60-h60-l90-rj"></div>
+      <yt-formatted-string class="title style-scope ytmusic-player-bar">Break My Stride</yt-formatted-string>
+      <yt-formatted-string class="byline style-scope ytmusic-player-bar complex-string"><a href="channel/UC1">Matthew Wilder</a> • <a href="browse/MPREb_1">I Don't Speak The Language</a> • <span>1983</span></yt-formatted-string>
+    </ytmusic-player-bar>
+    <tp-yt-paper-slider id="progress-bar" role="progressbar" aria-label="Seek slider"></tp-yt-paper-slider>
+    <div id="settings">
+      <ytmusic-setting-single-option-menu-renderer id="aq">
+        <tp-yt-paper-listbox>
+          <tp-yt-paper-item id="aq-normal">Normal</tp-yt-paper-item>
+          <tp-yt-paper-item id="aq-low">Low</tp-yt-paper-item>
+        </tp-yt-paper-listbox>
+      </ytmusic-setting-single-option-menu-renderer>
+    </div>
+    <script>
+      const player = document.getElementById('movie_player');
+      const video = player.querySelector('video');
+      const state = window.__ytm = { presenting: 2, calls: [], track: { video_id: 'UhLDA4Wr2GU', title: 'Break My Stride', author: 'Matthew Wilder' }, album: "I Don't Speak The Language" };
+      // Ad media: the same element carries the ad clip while the ad player presents.
+      let duration = 30.061, currentTime = 1.2, paused = false, ended = false;
+      Object.defineProperty(video, 'duration', { configurable: true, get: () => duration });
+      Object.defineProperty(video, 'paused', { configurable: true, get: () => paused });
+      Object.defineProperty(video, 'ended', { configurable: true, get: () => ended });
+      Object.defineProperty(video, 'currentTime', { configurable: true, get: () => currentTime, set: v => {
+        state.calls.push(['seek', v, state.presenting]);
+        if (state.presenting === 2 && v >= duration) {
+          // The ad player finishes its media and hands back to content at 0.
+          state.presenting = 1; duration = 184; currentTime = 0;
+          player.classList.remove('ad-showing', 'ad-interrupting');
+          video.dispatchEvent(new Event('durationchange'));
+          video.dispatchEvent(new Event('playing'));
+        } else { currentTime = v; }
+      }});
+      let presentationMode = 'inline';
+      Object.defineProperty(video, 'webkitPresentationMode', { configurable: true, get: () => presentationMode });
+      video.webkitSupportsPresentationMode = mode => mode === 'picture-in-picture';
+      video.webkitSetPresentationMode = mode => { presentationMode = mode; state.calls.push(['presentation', mode]); video.dispatchEvent(new Event('webkitpresentationmodechanged')); };
+      video.play = () => { paused = false; video.dispatchEvent(new Event('play')); return Promise.resolve(); };
+      video.pause = () => { paused = true; video.dispatchEvent(new Event('pause')); };
+      player.getPresentingPlayerType = () => state.presenting;
+      player.getVideoData = () => state.track;
+      player.getPlayerResponse = () => ({ videoDetails: { videoId: state.track.video_id, title: state.track.title, author: state.track.author,
+        thumbnail: { thumbnails: [{ url: 'https://yt3.googleusercontent.com/art=w60-h60-l90-rj', width: 60, height: 60 }, { url: 'https://yt3.googleusercontent.com/art=w544-h544-l90-rj', width: 544, height: 544 }] } } });
+      player.getCurrentTime = () => currentTime;
+      player.playVideo = () => { state.calls.push(['playVideo']); video.play(); };
+      player.pauseVideo = () => { state.calls.push(['pauseVideo']); video.pause(); };
+      player.seekTo = t => { state.calls.push(['seekTo', t]); currentTime = t; };
+      player.nextVideo = () => { state.calls.push(['nextVideo']); };
+      player.previousVideo = () => { state.calls.push(['previousVideo']); };
+      player.getOption = () => []; player.isSubtitlesOn = () => false; player.setOption = () => {}; player.loadModule = () => {};
+      window.__ytmTick = () => { if (!paused && state.presenting === 1) currentTime += 1; video.dispatchEvent(new Event('timeupdate')); };
+      window.__ytmScrub = (target, startPlaying) => {
+        paused = !startPlaying;
+        const slider = document.getElementById('progress-bar');
+        slider.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+        // YTM pauses song-mode media while its Polymer slider is dragging. iOS
+        // then emits touchstart for the same gesture after pointerdown.
+        paused = true; video.dispatchEvent(new Event('pause'));
+        slider.dispatchEvent(new TouchEvent('touchstart', { bubbles: true }));
+        currentTime = target; video.dispatchEvent(new Event('seeking')); video.dispatchEvent(new Event('seeked'));
+        slider.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+      };
+      window.__ytmNextTrack = () => {
+        state.track = { video_id: 'lYBUbBu4W08', title: 'Second Song', author: 'Second Artist' };
+        state.album = 'Second Album';
+        document.querySelector('ytmusic-player-bar .title').textContent = 'Second Song';
+        currentTime = 0; duration = 201;
+        video.dispatchEvent(new Event('durationchange'));
+        video.dispatchEvent(new Event('loadedmetadata'));
+        document.dispatchEvent(new CustomEvent('yt-navigate-finish'));
+      };
+      const menu = document.getElementById('aq');
+      menu.data = { itemId: 'MUSIC_WEB_AUDIO_QUALITY', items: [
+        { settingMenuItemRenderer: { name: 'Normal', value: '2', updateServiceEndpoint: { setSettingEndpoint: { settingItemId: '304', intValue: '2', settingItemIdForClient: 'MUSIC_WEB_AUDIO_QUALITY' } } } },
+        { settingMenuItemRenderer: { name: 'Low', value: '1', updateServiceEndpoint: { setSettingEndpoint: { settingItemId: '304', intValue: '1', settingItemIdForClient: 'MUSIC_WEB_AUDIO_QUALITY' } } } }
+      ] };
+      menu.selected = 0;
+      // Polymer updates selected from the listbox after the click bubbles.
+      menu.addEventListener('click', e => { const item = e.target.closest('tp-yt-paper-item'); if (item) menu.selected = item.id === 'aq-low' ? 1 : 0; });
+    <\/script></body></html>`;
+  const musicPrelude = `
+    HTMLElement.prototype.getOption = function () { return []; };
+    HTMLElement.prototype.isSubtitlesOn = function () { return false; };
+    HTMLElement.prototype.setOption = function () {};
+    HTMLElement.prototype.loadModule = function () {};
+    try { localStorage.setItem('wblock.tubeCleaner.musicAudioQuality', 'AUDIO_QUALITY_LOW'); } catch (e) {}
+  `;
+  const { browser, page, pageErrors } = await runScenario('Tube Cleaner (YouTube Music ads, audio quality, Now Playing)', {
+    device: devices['iPhone 13'],
+    gotoURL: 'https://music.youtube.com/watch?v=UhLDA4Wr2GU',
+    responseBody: musicFixture,
+    readySignal: 'ytmusic-player-bar',
+    viewport: { width: 390, height: 844 },
+    hasTouch: true,
+    scriptSource: visibilityPrelude + '\n' + mediaSessionPrelude + '\n' + musicPrelude + '\n' + userscript,
+  });
+  const S = 'tube-cleaner-youtube-music-capabilities';
+
+  await check(page, S, 'ends the presenting ad through its own media without touching content time', () => {
+    const seeks = window.__ytm.calls.filter(c => c[0] === 'seek');
+    const contentSeeks = seeks.filter(c => c[2] !== 2);
+    return {
+      pass: window.__ytm.presenting === 1 && seeks.length === 1 && seeks[0][1] >= 30 && contentSeeks.length === 0 &&
+        !document.getElementById('movie_player').classList.contains('ad-showing') &&
+        document.querySelector('#movie_player video').currentTime === 0,
+      detail: `presenting=${window.__ytm.presenting} seeks=${JSON.stringify(seeks)} ct=${document.querySelector('#movie_player video').currentTime}`,
+    };
+  });
+
+  await page.evaluate(() => { for (let i = 0; i < 5; i++) window.__ytmTick(); });
+  await check(page, S, 'never seeks content playback after the ad', () => {
+    const seeks = window.__ytm.calls.filter(c => c[0] === 'seek');
+    return { pass: seeks.length === 1 && document.querySelector('#movie_player video').currentTime === 5,
+      detail: `seeks=${seeks.length} ct=${document.querySelector('#movie_player video').currentTime}` };
+  });
+
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event('blur'));
+    window.__ytmPiPOnBlur = document.querySelector('#movie_player video').webkitPresentationMode;
+    window.__wblockNativeHidden = true; window.__wblockNativeVisibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+    window.__wblockNativeHidden = false; window.__wblockNativeVisibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await check(page, S, 'uses WebKit PiP to keep video-mode playback alive in the background', () => {
+    const modes = window.__ytm.calls.filter(c => c[0] === 'presentation').map(c => c[1]);
+    return { pass: window.__ytmPiPOnBlur === 'picture-in-picture' &&
+      JSON.stringify(modes) === JSON.stringify(['picture-in-picture', 'inline']) && document.visibilityState === 'visible' && !document.querySelector('.wblock-tc-native, .wblock-tc-toolbar'),
+      detail: `modes=${modes.join(',')} visibility=${document.visibilityState}` };
+  });
+
+  await page.evaluate(() => window.__ytmScrub(44, true));
+  await page.evaluate(() => new Promise(r => setTimeout(r, 150)));
+  await check(page, S, 'resumes a playing song after YTM pauses it for a scrub', () => {
+    const plays = window.__ytm.calls.filter(c => c[0] === 'playVideo').length;
+    return { pass: document.querySelector('#movie_player video').paused === false &&
+      document.querySelector('#movie_player video').currentTime === 44 && plays === 1,
+      detail: `paused=${document.querySelector('#movie_player video').paused} ct=${document.querySelector('#movie_player video').currentTime} plays=${plays}` };
+  });
+  await page.evaluate(() => window.__ytmScrub(72, false));
+  await page.evaluate(() => new Promise(r => setTimeout(r, 150)));
+  await check(page, S, 'does not resume a song that was paused before scrubbing', () => {
+    const plays = window.__ytm.calls.filter(c => c[0] === 'playVideo').length;
+    return { pass: document.querySelector('#movie_player video').paused === true &&
+      document.querySelector('#movie_player video').currentTime === 72 && plays === 1,
+      detail: `paused=${document.querySelector('#movie_player video').paused} ct=${document.querySelector('#movie_player video').currentTime} plays=${plays}` };
+  });
+  await page.evaluate(() => document.getElementById('movie_player').playVideo());
+
+  await check(page, S, 'restores the stored audio quality into ytcfg before playback', () => ({
+    pass: window.ytcfg.get('AUDIO_QUALITY') === 'AUDIO_QUALITY_LOW',
+    detail: `AUDIO_QUALITY=${window.ytcfg.get('AUDIO_QUALITY')}`,
+  }));
+
+  await page.click('#aq-normal');
+  await check(page, S, 'remembers a stock Audio quality pick and applies it client-side', () => ({
+    pass: window.ytcfg.get('AUDIO_QUALITY') === 'AUDIO_QUALITY_MEDIUM' &&
+      localStorage.getItem('wblock.tubeCleaner.musicAudioQuality') === 'AUDIO_QUALITY_MEDIUM',
+    detail: `cfg=${window.ytcfg.get('AUDIO_QUALITY')} stored=${localStorage.getItem('wblock.tubeCleaner.musicAudioQuality')}`,
+  }));
+  await page.click('#aq-low');
+  await check(page, S, 'follows a second pick back to Low', () => ({
+    pass: window.ytcfg.get('AUDIO_QUALITY') === 'AUDIO_QUALITY_LOW' &&
+      localStorage.getItem('wblock.tubeCleaner.musicAudioQuality') === 'AUDIO_QUALITY_LOW',
+    detail: `cfg=${window.ytcfg.get('AUDIO_QUALITY')}`,
+  }));
+
+  await check(page, S, 'publishes Now Playing from player data when the site has not', () => {
+    const m = navigator.mediaSession.metadata;
+    const art = m && m.artwork || [];
+    return {
+      pass: !!m && m.title === 'Break My Stride' && m.artist === 'Matthew Wilder' && m.album === "I Don't Speak The Language" &&
+        document.querySelector('#movie_player video').getAttribute('title') === 'Break My Stride' &&
+        art.length === 2 && /w544-h544/.test(art[1].src) && navigator.mediaSession.playbackState === 'playing' &&
+        window.__wblockMediaSessionState.positions.length > 0,
+      detail: `title=${m && m.title} album=${m && m.album} art=${art.length} state=${navigator.mediaSession.playbackState} positions=${window.__wblockMediaSessionState.positions.length}`,
+    };
+  });
+
+  await check(page, S, 'keeps stock lock-screen semantics through the player API', () => {
+    const h = window.__wblockMediaSessionState.handlers;
+    const before = window.__ytm.calls.length;
+    h.pause(); h.nexttrack(); h.previoustrack(); h.play();
+    const names = window.__ytm.calls.slice(before).map(c => c[0]);
+    return { pass: JSON.stringify(names) === JSON.stringify(['pauseVideo', 'nextVideo', 'previousVideo', 'playVideo']), detail: names.join(',') };
+  });
+
+  await page.evaluate(() => {
+    window.__ytmPlaysBeforeIntentionalPause = window.__ytm.calls.filter(c => c[0] === 'playVideo').length;
+    window.__wblockMediaSessionState.handlers.pause();
+  });
+  await page.evaluate(() => new Promise(r => setTimeout(r, 400)));
+  await check(page, S, 'leaves an intentional pause paused', () => {
+    const plays = window.__ytm.calls.filter(c => c[0] === 'playVideo').length;
+    return { pass: document.querySelector('#movie_player video').paused === true && navigator.mediaSession.playbackState === 'paused' &&
+      plays === window.__ytmPlaysBeforeIntentionalPause,
+      detail: `paused=${document.querySelector('#movie_player video').paused} state=${navigator.mediaSession.playbackState} plays=${plays}` };
+  });
+  await page.evaluate(() => { window.__wblockMediaSessionState.handlers.play(); });
+
+  await page.evaluate(() => window.__ytmNextTrack());
+  await check(page, S, 'updates Now Playing on a track change in the same video element', () => {
+    const m = navigator.mediaSession.metadata;
+    const title = document.querySelector('#movie_player video').getAttribute('title');
+    return { pass: !!m && m.title === 'Second Song' && m.artist === 'Second Artist' && title === 'Second Song', detail: `title=${m && m.title} artist=${m && m.artist} videoTitle=${title}` };
+  });
+
+  await page.evaluate(() => {
+    // The site publishes its own metadata for the current track: Tube Cleaner must stand down.
+    navigator.mediaSession.metadata = new MediaMetadata({ title: 'Second Song', artist: 'Site Artist', album: 'Site Album' });
+    window.__wblockMediaSessionState.positions.length = 0;
+    for (let i = 0; i < 3; i++) window.__ytmTick();
+    document.dispatchEvent(new CustomEvent('yt-navigate-finish'));
+  });
+  await page.evaluate(() => new Promise(r => setTimeout(r, 700)));
+  await check(page, S, 'defers to metadata the site publishes itself', () => {
+    const m = navigator.mediaSession.metadata;
+    return { pass: !!m && m.artist === 'Site Artist' && window.__wblockMediaSessionState.positions.length === 0,
+      detail: `artist=${m && m.artist} positions=${window.__wblockMediaSessionState.positions.length}` };
+  });
+
+  await check(page, S, 'keeps lock-screen seeking wired after the site publishes metadata', () => {
+    const h = window.__wblockMediaSessionState.handlers;
+    const before = window.__ytm.calls.length;
+    h.seekto({ seekTime: 80 }); h.seekforward({ seekOffset: 7 }); h.seekbackward({ seekOffset: 3 });
+    const calls = window.__ytm.calls.slice(before);
+    const expected = [['seekTo', 80], ['seekTo', 87], ['seekTo', 84]];
+    return { pass: JSON.stringify(calls) === JSON.stringify(expected) && navigator.mediaSession.metadata.artist === 'Site Artist',
+      detail: `calls=${JSON.stringify(calls)} artist=${navigator.mediaSession.metadata.artist}` };
+  });
+
+  await page.evaluate(() => {
+    // Player replacement: YTM tears down #movie_player and inserts a new one with a fresh <video>.
+    const old = document.getElementById('movie_player');
+    const fresh = old.cloneNode(false);
+    fresh.className = 'html5-video-player ytp-hide-controls playing-mode';
+    fresh.innerHTML = '<div class="html5-video-container"><video playsinline></video></div>';
+    const v = fresh.querySelector('video');
+    Object.defineProperty(v, 'duration', { configurable: true, get: () => 150 });
+    Object.defineProperty(v, 'paused', { configurable: true, get: () => false });
+    Object.defineProperty(v, 'currentTime', { configurable: true, get: () => 3, set: () => {} });
+    fresh.getPresentingPlayerType = () => 1;
+    fresh.getVideoData = () => ({ video_id: 'QAo_Ycocl1E', title: 'Replaced Player Song', author: 'Third Artist' });
+    fresh.getPlayerResponse = () => ({ videoDetails: { thumbnail: { thumbnails: [] } } });
+    fresh.getCurrentTime = () => 3;
+    fresh.playVideo = () => { window.__ytm.calls.push(['fresh.playVideo']); };
+    fresh.pauseVideo = () => {};
+    fresh.getOption = () => []; fresh.isSubtitlesOn = () => false; fresh.setOption = () => {}; fresh.loadModule = () => {};
+    navigator.mediaSession.metadata = null;
+    old.replaceWith(fresh);
+    v.dispatchEvent(new Event('loadedmetadata'));
+  });
+  await check(page, S, 'rebinds to a replaced player and republishes missing metadata', () => {
+    const m = navigator.mediaSession.metadata;
+    const art = m && m.artwork || [];
+    window.__wblockMediaSessionState.handlers.play();
+    return { pass: !!m && m.title === 'Replaced Player Song' && art.length === 1 && /art=w60/.test(art[0].src) &&
+      window.__ytm.calls.some(c => c[0] === 'fresh.playVideo') &&
+      !document.querySelector('.wblock-tc-native, .wblock-tc-toolbar') && !document.querySelector('#movie_player video').controls,
+      detail: `title=${m && m.title} art=${art.length} fresh=${window.__ytm.calls.some(c => c[0] === 'fresh.playVideo')}` };
+  });
+
+  await page.screenshot({ path: join(__dirname, 'artifacts', 'tube-cleaner-youtube-music-capabilities.png'), fullPage: true });
+  record(S, 'no uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
+  await browser.close();
+}
+
 
 // ---- Scenario 12: production injector starts before <html> exists -------
 // Playwright init scripts run at Safari's true document_start: readyState is
