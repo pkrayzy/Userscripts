@@ -1,19 +1,6 @@
 // ==UserScript==
 // @name         Tube Cleaner
 // @namespace    com.skula.wblock
-<<<<<<< HEAD
-// @version      0.1.27
-// @description  Gives YouTube Safari-native controls, chapters, subtitles, picture-in-picture, background playback, quality selection, and audio-only mode.
-// @description:de  Bietet YouTube native Safari-Steuerelemente, Kapitel, Untertitel, Bild-in-Bild, Hintergrundwiedergabe, Qualitätsauswahl und einen Nur-Audio-Modus.
-// @description:es  Añade a YouTube controles nativos de Safari, capítulos, subtítulos, imagen en imagen, reproducción en segundo plano, selección de calidad y modo de solo audio.
-// @description:fr  Ajoute à YouTube les commandes natives de Safari, les chapitres, les sous-titres, l’image dans l’image, la lecture en arrière-plan, le choix de qualité et le mode audio seul.
-// @description:it  Aggiunge a YouTube controlli nativi di Safari, capitoli, sottotitoli, picture-in-picture, riproduzione in background, selezione qualità e modalità solo audio.
-// @description:pt-BR  Adiciona ao YouTube controles nativos do Safari, capítulos, legendas, picture-in-picture, reprodução em segundo plano, seleção de qualidade e modo somente áudio.
-// @description:ja  YouTubeにSafariネイティブのコントロール、チャプター、字幕、ピクチャーインピクチャー、バックグラウンド再生、画質選択、音声のみモードを追加します。
-// @description:ko  YouTube에 Safari 네이티브 컨트롤, 챕터, 자막, PIP, 백그라운드 재생, 화질 선택 및 오디오 전용 모드를 추가합니다.
-// @description:ru  Добавляет YouTube нативные элементы управления Safari, главы, субтитры, картинку-в-картинке, фоновое воспроизведение, выбор качества и аудиорежим.
-// @description:zh-Hans  为 YouTube 添加 Safari 原生控件、章节、字幕、画中画、后台播放、画质选择和纯音频模式。
-=======
 // @version      0.1.29
 // @description  Gives YouTube Safari-native controls, chapters, subtitles, SponsorBlock, optional DeArrow branding, picture-in-picture, background playback, quality selection, and audio-only mode.
 // @description:de  Bietet YouTube native Safari-Steuerelemente, Kapitel, Untertitel, SponsorBlock, optionales DeArrow-Branding, Bild-in-Bild, Hintergrundwiedergabe, Qualitätsauswahl und einen Nur-Audio-Modus.
@@ -25,7 +12,6 @@
 // @description:ko  YouTube에 Safari 네이티브 컨트롤, 챕터, 자막, SponsorBlock, 선택적 DeArrow 브랜딩, PIP, 백그라운드 재생, 화질 선택 및 오디오 전용 모드를 추가합니다.
 // @description:ru  Добавляет YouTube нативные элементы управления Safari, главы, субтитры, SponsorBlock, дополнительный брендинг DeArrow, картинку-в-картинке, фоновое воспроизведение, выбор качества и аудиорежим.
 // @description:zh-Hans  为 YouTube 添加 Safari 原生控件、章节、字幕、SponsorBlock、可选的 DeArrow 品牌替换、画中画、后台播放、画质选择和纯音频模式。
->>>>>>> eb696d3eba52e52cf3903dde9a0632948e116ee2
 // @author       wBlock
 // @match        https://www.youtube.com/*
 // @match        https://youtube.com/*
@@ -36,8 +22,8 @@
 // @run-at       document-start
 // @inject-into  page
 // @grant        none
-// @downloadURL  https://raw.githubusercontent.com/pkrayzy/Userscripts/main/packages/tube-cleaner/dist/tube-cleaner.user.js
-// @updateURL    https://raw.githubusercontent.com/pkrayzy/Userscripts/main/packages/tube-cleaner/dist/tube-cleaner.meta.js
+// @downloadURL  https://raw.githubusercontent.com/0xCUB3/wBlock-userscripts/main/packages/tube-cleaner/dist/tube-cleaner.user.js
+// @updateURL    https://raw.githubusercontent.com/0xCUB3/wBlock-userscripts/main/packages/tube-cleaner/dist/tube-cleaner.meta.js
 // ==/UserScript==
 
 (function () {
@@ -112,7 +98,7 @@
     // ------------------------------------------------------------------
 
     var AUTO_PIP_KEY = 'wblock.tubeCleaner.autoPiP';
-    var autoPiPEnabled = false;
+    var autoPiPEnabled = true;
     var pipActive = false;
 
     function getAutoPiP() {
@@ -127,7 +113,7 @@
         autoPiPEnabled = v;
     }
 
-    try { autoPiPEnabled = false; } catch (e) { /* ignore */ }
+    try { autoPiPEnabled = getAutoPiP(); } catch (e) { /* ignore */ }
 
     function supportsWebkitPiP(video) {
         try {
@@ -191,7 +177,86 @@
     }
 
     function setupAutoPiP(video) {
-        // Disabled by user request
+        if (!video || video._wblockAutoPiPHooked) return;
+        video._wblockAutoPiPHooked = true;
+
+        // Tab switch: enter PiP when tab hides, exit when visible.
+        // Note: enableBackgroundPlayback() overrides document.hidden to always
+        // return false, so we use _realHidden which tracks the true state.
+        function onVisibilityChange() {
+            if (!autoPiPEnabled) return;
+            if (_realHidden) {
+                if (!video.paused && !video.ended) {
+                    enterPiP(video);
+                }
+            } else if (document.hasFocus() && isPiPActive(video)) {
+                exitPiP(video);
+            }
+        }
+
+        // Losing keyboard focus does not mean the video is obscured on macOS:
+        // another visible window may simply be active beside Safari. Enter PiP
+        // only for actual page hiding or when the video scrolls out of view.
+        function onFocus() {
+            if (!autoPiPEnabled) return;
+            if (_realHidden) return;
+            if (document.hasFocus() && isPiPActive(video)) {
+                exitPiP(video);
+            }
+        }
+        function onBlur() {
+            // iPhone can suspend a video before its hidden event is delivered.
+            // Enter while the page still owns an active playback gesture.
+            if (IS_IPHONE && !video.paused && !video.ended) enterPiP(video);
+        }
+
+        var removeVisibilityObserver = observeRealVisibility(onVisibilityChange);
+        window.addEventListener('focus', onFocus);
+        window.addEventListener('blur', onBlur);
+
+        // Scroll out of view: use IntersectionObserver.
+        // On mobile YouTube the watch player is normally position:fixed (sticky).
+        // Tube Cleaner overrides it to position:absolute so it scrolls with the
+        // page. Without this guard the observer would enter PiP every time the
+        // user scrolls past the video to read comments.
+        var stickyContainer = document.getElementById('player-container-id');
+        var skipScrollPiP = !!(stickyContainer && stickyContainer.classList.contains('sticky-player'));
+        var scrollObserver = null;
+        if (!skipScrollPiP) {
+            scrollObserver = new IntersectionObserver(function (entries) {
+                if (!autoPiPEnabled) return;
+                entries.forEach(function (entry) {
+                    if (!entry.isIntersecting && !video.paused && !video.ended) {
+                        enterPiP(video);
+                    } else if (entry.isIntersecting && isPiPActive(video)) {
+                        exitPiP(video);
+                    }
+                });
+            }, { threshold: 0.1 });
+            scrollObserver.observe(video);
+        }
+
+        // Listen for presentation mode changes
+        function onPresentationModeChange() {
+            if (video.webkitPresentationMode !== 'picture-in-picture') {
+                pipActive = false;
+            }
+            log('presentation mode changed:', video.webkitPresentationMode);
+        }
+        function onLeavePictureInPicture() { pipActive = false; }
+        video.addEventListener('webkitpresentationmodechanged', onPresentationModeChange);
+        video.addEventListener('leavepictureinpicture', onLeavePictureInPicture);
+
+        // Release all of the above when this video is superseded, so listeners
+        // and observers do not accumulate across SPA navigations.
+        registerCleanup(function () {
+            removeVisibilityObserver();
+            window.removeEventListener('focus', onFocus);
+            window.removeEventListener('blur', onBlur);
+            try { if (scrollObserver) scrollObserver.disconnect(); } catch (e) { /* ignore */ }
+            video.removeEventListener('webkitpresentationmodechanged', onPresentationModeChange);
+            video.removeEventListener('leavepictureinpicture', onLeavePictureInPicture);
+        });
     }
 
     // ------------------------------------------------------------------
@@ -2044,7 +2109,253 @@
     }
 
     function setupSponsorBlock(player, video) {
-        // Disabled by user request
+        var videoId = sponsorBlockVideoId();
+        if (!player || !video || !videoId || !window.crypto || !crypto.subtle || !window.fetch) return;
+        var cancelled = false;
+        var controller = null;
+        var requested = false;
+        var segments = [];
+        var ignored = {};
+        var notified = {};
+        var removeNotice = null;
+        var boundaryTimer = null;
+        var boundaryKey = null;
+        var timingSuspended = false;
+
+        function clearBoundaryTimer() {
+            if (boundaryTimer !== null) clearTimeout(boundaryTimer);
+            boundaryTimer = null;
+            boundaryKey = null;
+        }
+
+        function segmentState(item, settings) {
+            var key = item.UUID || item.category + ':' + item.segment.join(':');
+            var mode = settings.modes[item.category] || 'off';
+            var eligible = mode !== 'off' && !ignored[key] &&
+                (!item.actionType || item.actionType === 'skip') &&
+                item.segment[1] - item.segment[0] >= settings.minimumDuration;
+            return { key: key, mode: mode, eligible: eligible };
+        }
+
+        // Undo and ask-mode notification state lasts only until playback leaves
+        // that segment. Staying inside after Undo remains protected, while a
+        // later re-entry behaves like the first visit.
+        function clearExitedSegmentState(now) {
+            for (var i = 0; i < segments.length; i++) {
+                var item = segments[i];
+                if (now >= item.segment[0] && now < item.segment[1]) continue;
+                var key = item.UUID || item.category + ':' + item.segment.join(':');
+                delete ignored[key];
+                delete notified[key];
+            }
+        }
+
+        // Keep timeupdate as a throttling/background fallback, but normally arm
+        // one timer for the next segment boundary. This avoids waiting up to a
+        // full timeupdate interval before an automatic skip.
+        function scheduleNextBoundary(settings, now, force) {
+            if (cancelled || timingSuspended || video.seeking || video.paused || video.ended || !settings.enabled ||
+                sponsorBlockDisabledVideos[videoId] || sponsorBlockChannelExcluded(settings)) {
+                clearBoundaryTimer();
+                return;
+            }
+            var next = null;
+            var nextState = null;
+            for (var i = 0; i < segments.length; i++) {
+                var item = segments[i];
+                var state = segmentState(item, settings);
+                if (!state.eligible || state.mode === 'ask' && notified[state.key] || item.segment[0] <= now) continue;
+                next = item;
+                nextState = state;
+                break;
+            }
+            if (!next) { clearBoundaryTimer(); return; }
+            var key = nextState.key + '@' + next.segment[0] + ':' + video.playbackRate;
+            if (!force && boundaryTimer !== null && boundaryKey === key) return;
+            clearBoundaryTimer();
+            boundaryKey = key;
+            var rate = isFinite(video.playbackRate) && video.playbackRate > 0 ? video.playbackRate : 1;
+            var delay = Math.max(0, (next.segment[0] - now) * 1000 / rate + 8);
+            boundaryTimer = setTimeout(function () {
+                boundaryTimer = null;
+                boundaryKey = null;
+                onTimeUpdate();
+            }, Math.min(delay, 2147483647));
+        }
+
+        function onTimeUpdate(forceSchedule) {
+            if (timingSuspended || video.seeking) { clearBoundaryTimer(); return; }
+            var settings = loadSponsorBlockSettings();
+            if (!settings.enabled || sponsorBlockDisabledVideos[videoId] || sponsorBlockChannelExcluded(settings)) {
+                clearBoundaryTimer();
+                return;
+            }
+            var now = video.currentTime;
+            var duration = video.duration;
+            var hasDuration = isFinite(duration) && duration > 0;
+            // Once the media sits at its end, a segment whose SponsorBlock end
+            // time overshoots the real duration would keep re-seeking the
+            // element. YouTube treats any seek from its ended state as a
+            // replay request, so that loop restarts the video.
+            if (video.ended || (hasDuration && now >= duration - 0.05)) { clearBoundaryTimer(); return; }
+            clearExitedSegmentState(now);
+            for (var i = 0; i < segments.length; i++) {
+                var item = segments[i];
+                var state = segmentState(item, settings);
+                if (!state.eligible) continue;
+                if (now >= item.segment[0] && now < item.segment[1] - 0.05) {
+                    if (state.mode === 'ask') {
+                        if (!notified[state.key]) {
+                            notified[state.key] = true;
+                            if (removeNotice) removeNotice();
+                            removeNotice = showSponsorBlockNotice(player, video, item, ignored, 'skip');
+                        }
+                        scheduleNextBoundary(settings, now, true);
+                        return;
+                    }
+                    var target = item.segment[1];
+                    // Seeking a Safari media element to its exact duration
+                    // replays the video instead of ending it (the SponsorBlock
+                    // extension works around the same WebKit behavior). Stop
+                    // just short of the end so playback finishes on its own.
+                    if (hasDuration && target >= duration - 0.001) target = video.loop ? 0 : Math.max(0, duration - 0.001);
+                    try { video.currentTime = target; } catch (e) { return; }
+                    if (settings.showNotice) {
+                        if (removeNotice) removeNotice();
+                        removeNotice = showSponsorBlockNotice(player, video, item, ignored, 'undo');
+                    }
+                    scheduleNextBoundary(settings, item.segment[1], true);
+                    return;
+                }
+            }
+            scheduleNextBoundary(settings, now, !!forceSchedule);
+        }
+
+        function acceptBucket(bucket) {
+            var found = [];
+            if (Array.isArray(bucket)) for (var i = 0; i < bucket.length; i++) {
+                if (bucket[i].videoID === videoId && Array.isArray(bucket[i].segments)) {
+                    found = bucket[i].segments.filter(function (item) {
+                        return item && SPONSORBLOCK_CATEGORIES.some(function (category) { return category.id === item.category; }) &&
+                            Array.isArray(item.segment) && isFinite(item.segment[0]) && isFinite(item.segment[1]) &&
+                            item.segment[1] > item.segment[0];
+                    }).sort(function (a, b) { return a.segment[0] - b.segment[0]; });
+                    break;
+                }
+            }
+            segments = found;
+            cacheSponsorBlockSegments(videoId, found);
+            onTimeUpdate(true);
+        }
+
+        function loadSegments() {
+            var settings = loadSponsorBlockSettings();
+            if (requested || cancelled || !settings.enabled || sponsorBlockDisabledVideos[videoId] ||
+                sponsorBlockChannelExcluded(settings)) return;
+            var cached = cachedSponsorBlockSegments(videoId);
+            if (cached !== null) {
+                requested = true;
+                segments = cached;
+                onTimeUpdate(true);
+                return;
+            }
+            requested = true;
+            controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+            crypto.subtle.digest('SHA-256', new TextEncoder().encode(videoId)).then(function (buffer) {
+                var bytes = new Uint8Array(buffer);
+                var hash = '';
+                var categoryIds = SPONSORBLOCK_CATEGORIES.map(function (category) { return category.id; });
+                for (var i = 0; i < bytes.length; i++) hash += ('0' + bytes[i].toString(16)).slice(-2);
+                var query = '?categories=' + encodeURIComponent(JSON.stringify(categoryIds)) +
+                    '&actionTypes=' + encodeURIComponent(JSON.stringify(['skip']));
+                return fetch(SPONSORBLOCK_API + hash.slice(0, 5) + query,
+                    controller ? { signal: controller.signal } : {});
+            }).then(function (response) {
+                if (!response.ok) return [];
+                return response.json();
+            }).then(function (bucket) {
+                if (!cancelled) acceptBucket(bucket);
+            }).catch(function (error) {
+                if (!cancelled && (!error || error.name !== 'AbortError')) log('SponsorBlock unavailable', error);
+            });
+        }
+
+        function onSettingsChange() {
+            if (removeNotice) { removeNotice(); removeNotice = null; }
+            loadSegments();
+            onTimeUpdate(true);
+        }
+        function onTimeUpdateEvent() { onTimeUpdate(false); }
+        function onPlaybackResumed() { timingSuspended = false; onTimeUpdate(true); }
+        function onPlaybackTimingChange() { onTimeUpdate(true); }
+        function suspendBoundaryTimer() { timingSuspended = true; clearBoundaryTimer(); }
+
+        // iOS fullscreen fallback. Entering the native full-screen player can
+        // stop dispatching timeupdate to the shared element (or leave the
+        // boundary timer suspended after a waiting/seeking burst), so a segment
+        // entered while full-screen plays through instead of skipping. A low-rate
+        // poll re-checks the timeline whenever the element is advancing, and the
+        // presentation/fullscreen transitions re-arm the boundary timer. The poll
+        // never forces a skip while a seek or stall is in progress.
+        var pollTimer = null;
+        function pollBoundary() {
+            if (cancelled || timingSuspended || video.seeking || video.paused || video.ended) { return; }
+            onTimeUpdate(false);
+        }
+        function startPoll() {
+            if (pollTimer !== null || !IS_IOS) { return; }
+            pollTimer = setInterval(pollBoundary, 300);
+        }
+        function stopPoll() {
+            if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
+        }
+        function onFullscreenChange() {
+            timingSuspended = false;
+            onTimeUpdate(true);
+            startPoll();
+        }
+
+        video.addEventListener('timeupdate', onTimeUpdateEvent);
+        video.addEventListener('playing', onPlaybackResumed);
+        video.addEventListener('seeked', onPlaybackResumed);
+        video.addEventListener('ratechange', onPlaybackTimingChange);
+        video.addEventListener('seeking', suspendBoundaryTimer);
+        video.addEventListener('waiting', suspendBoundaryTimer);
+        video.addEventListener('stalled', suspendBoundaryTimer);
+        video.addEventListener('pause', clearBoundaryTimer);
+        video.addEventListener('ended', clearBoundaryTimer);
+        document.addEventListener('wblock-tc-sponsor-settings', onSettingsChange);
+        if (IS_IOS) {
+            video.addEventListener('webkitbeginfullscreen', onFullscreenChange);
+            video.addEventListener('webkitendfullscreen', onFullscreenChange);
+            document.addEventListener('fullscreenchange', onFullscreenChange);
+            document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+            startPoll();
+        }
+        registerCleanup(function () {
+            cancelled = true;
+            clearBoundaryTimer();
+            stopPoll();
+            video.removeEventListener('timeupdate', onTimeUpdateEvent);
+            video.removeEventListener('playing', onPlaybackResumed);
+            video.removeEventListener('seeked', onPlaybackResumed);
+            video.removeEventListener('ratechange', onPlaybackTimingChange);
+            video.removeEventListener('seeking', suspendBoundaryTimer);
+            video.removeEventListener('waiting', suspendBoundaryTimer);
+            video.removeEventListener('stalled', suspendBoundaryTimer);
+            video.removeEventListener('pause', clearBoundaryTimer);
+            video.removeEventListener('ended', clearBoundaryTimer);
+            document.removeEventListener('wblock-tc-sponsor-settings', onSettingsChange);
+            if (IS_IOS) {
+                video.removeEventListener('webkitbeginfullscreen', onFullscreenChange);
+                video.removeEventListener('webkitendfullscreen', onFullscreenChange);
+                document.removeEventListener('fullscreenchange', onFullscreenChange);
+                document.removeEventListener('webkitfullscreenchange', onFullscreenChange);
+            }
+            if (controller) controller.abort();
+            if (removeNotice) removeNotice();
+        });
+        loadSegments();
     }
 
     // ------------------------------------------------------------------
@@ -2572,7 +2883,22 @@
     }
 
     function scanForDeArrow(root) {
-        // Disabled by user request
+        var settings = loadDeArrowSettings();
+        if (!settings.enabled || !root) return;
+        applyCurrentDeArrowTitle();
+        var cards = [];
+        if (root.nodeType === 1) {
+            try {
+                if (root.matches(DEARROW_CARD_SELECTOR)) cards.push(root);
+                var closest = root.closest(DEARROW_CARD_SELECTOR);
+                if (closest && cards.indexOf(closest) === -1) cards.push(closest);
+            } catch (e) { /* ignore */ }
+        }
+        if (root.querySelectorAll) {
+            var nested = root.querySelectorAll(DEARROW_CARD_SELECTOR);
+            for (var i = 0; i < nested.length; i++) if (cards.indexOf(nested[i]) === -1) cards.push(nested[i]);
+        }
+        for (var j = 0; j < cards.length; j++) queueDeArrowCard(cards[j]);
     }
 
     function scheduleDeArrowScan(root) {
@@ -4344,6 +4670,7 @@
         document.addEventListener('click', onSponsorOutsideClick);
         registerCleanup(function () { document.removeEventListener('click', onSponsorOutsideClick); });
         updateSponsorButton();
+        sponsorWrap.appendChild(sponsorBtn); sponsorWrap.appendChild(sponsorMenu); servicesRow.appendChild(sponsorWrap);
 
         // PiP button is intentionally omitted — Safari's native controls
         // already provide PiP. Auto PiP handles automatic PiP entry.
@@ -4654,6 +4981,7 @@
         }
 
         transformPlayer();
+        refreshDeArrowBranding();
         setTimeout(transformPlayer, 500);
     }
 
@@ -4968,6 +5296,17 @@
                     }
                 }
             }
+            // DeArrow follows YouTube's lazily inserted and recycled cards. Its
+            // scan is microtask-batched and does no work while the opt-in feature
+            // is disabled.
+            if (loadDeArrowSettings().enabled) {
+                for (var k = 0; k < records.length; k++) {
+                    scheduleDeArrowScan(records[k].target);
+                    for (var n = 0; n < records[k].addedNodes.length; n++) {
+                        if (records[k].addedNodes[n].nodeType === 1) scheduleDeArrowScan(records[k].addedNodes[n]);
+                    }
+                }
+            }
             // MutationObserver runs before rendering. Transform now—no polling
             // interval or debounce—so YouTube chrome never reaches next paint.
             if (relevant) { transformPlayer(); }
@@ -4995,6 +5334,7 @@
         watchNavigation();
         setupFullscreenHotkey();
         transformPlayer();
+        scheduleDeArrowScan(document);
 
         // Recovery scans only; normal startup is handled pre-paint above.
         if (document.readyState === 'loading') {
